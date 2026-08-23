@@ -1,0 +1,18 @@
+# Xcode / SwiftPM
+.build/
+.build/*
+build/
+*.xcodeproj
+xcuserdata/
+.swiftpm/
+
+# macOS
+.DS_Store
+._*
+
+# Agent tooling artifacts
+.mimosa/
+
+# Editor
+.vscode/
+.idea/
