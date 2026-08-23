@@ -14,6 +14,13 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Pictool" "$APP/Contents/MacOS/PureView"
 cp "Assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
+# 声明可用本地化:系统面板(NSPrintPanel 等)据此跟随用户语言渲染,
+# 缺失时系统会退回默认开发区域(英文)。空 Localizable.strings 仅作占位。
+for lang in en zh-Hans; do
+    mkdir -p "$APP/Contents/Resources/$lang.lproj"
+    : > "$APP/Contents/Resources/$lang.lproj/Localizable.strings"
+done
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25,6 +32,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key><string>PureView</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>zh-Hans</string>
+    </array>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>

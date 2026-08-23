@@ -50,6 +50,24 @@ struct ThumbnailGridView: View {
                                 ThumbCell(file: file, isCurrent: file.id == store.selectedImageID)
                                     .id(file.id)
                                     .onTapGesture { store.selectImage(file.id) }
+                                    .contextMenu {
+                                        Button {
+                                            store.copyImageToPasteboard(file.id)
+                                        } label: {
+                                            Label("复制图片", systemImage: "doc.on.doc")
+                                        }
+                                        Button {
+                                            store.hideImage(file.id)
+                                        } label: {
+                                            Label("隐藏", systemImage: "eye.slash")
+                                        }
+                                        Divider()
+                                        Button(role: .destructive) {
+                                            store.deleteImage(file.id)
+                                        } label: {
+                                            Label("删除", systemImage: "trash")
+                                        }
+                                    }
                             }
                         }
                         .padding(12)

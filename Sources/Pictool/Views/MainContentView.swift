@@ -7,7 +7,7 @@ struct MainContentView: View {
 
     @Environment(FolderStore.self) private var store
     @State private var showCropSheet = false
-    @State private var showPrintSheet = false
+    @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
 
     var body: some View {
@@ -23,14 +23,11 @@ struct MainContentView: View {
                 .sheet(isPresented: $showCropSheet) {
                     if let file = store.currentImage { CropView(file: file) }
                 }
-                .sheet(isPresented: $showPrintSheet) {
-                    if let file = store.currentImage { PrintOptionsView(file: file) }
-                }
                 .onChange(of: store.cropRequestToken) { _, _ in
                     showCropSheet = store.currentImage != nil
                 }
                 .onChange(of: store.printRequestToken) { _, _ in
-                    showPrintSheet = store.currentImage != nil
+                    prepareAndPrint()
                 }
         }
         .frame(minWidth: 960, minHeight: 600)
@@ -38,6 +35,25 @@ struct MainContentView: View {
         .onOpenURL { url in handleExternal(url) }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleDrop(providers)
+        }
+        .overlay {
+            if isPreparingPrint { ProgressView("正在准备打印…") }
+        }
+    }
+
+    private func prepareAndPrint() {
+        guard let file = store.currentImage, !isPreparingPrint else { return }
+        isPreparingPrint = true
+        let url = file.url
+        Task {
+            let image = await Task.detached(priority: .userInitiated) {
+                try? ImageLoader.decode(url: url, maxPixelSize: nil)
+            }.value
+            isPreparingPrint = false
+            guard let image else { return }
+            await MainActor.run {
+                PrintService.print(image: image)
+            }
         }
     }
 

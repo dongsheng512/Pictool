@@ -1,40 +1,37 @@
 import AppKit
 
-enum PrintScaleMode: String, CaseIterable, Identifiable {
-    case fitPage = "适配页面"
-    case actualSize = "实际大小"
-    var id: String { rawValue }
-}
-
 @MainActor
 enum PrintService {
 
-    /// 使用标准打印面板打印图片;横向/纵向按图片宽高比自动选择。
-    /// 非阻塞呈现(runOperationModal),避免与 SwiftUI sheet 关闭动画产生模态冲突。
-    static func print(image: NSImage, mode: PrintScaleMode) {
+    /// 使用标准打印面板打印图片。方向与缩放百分比由原生打印面板设置。
+    /// 图像默认适配可打印区域并居中;Scaling 控件在此基础上做相对百分比调整。
+    static func print(image: NSImage) {
         let info = NSPrintInfo.shared
-        info.orientation = image.size.width >= image.size.height ? .landscape : .portrait
-        let page = info.imageablePageBounds
-        let view = PrintPageView(image: image, pageBounds: page, mode: mode)
+        info.horizontalPagination = .automatic
+        info.verticalPagination = .automatic
+        info.scalingFactor = 1.0
+
+        let imageable = info.imageablePageBounds
+        let page = CGRect(origin: .zero, size: info.paperSize)
+        let view = PrintPageView(image: image, pageBounds: page, imageableBounds: imageable)
         let operation = NSPrintOperation(view: view, printInfo: info)
         operation.canSpawnSeparateThread = true
+        operation.printPanel.options.insert([.showsOrientation, .showsScaling])
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
             operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
         }
     }
 }
 
-/// 单页绘制视图:图像居中,按模式缩放
+/// 整页绘制视图:图像按可打印区域适配缩放后居中,预览和输出一致。
 final class PrintPageView: NSView {
 
     private let image: NSImage
-    private let pageBounds: CGRect
-    private let mode: PrintScaleMode
+    private let imageableBounds: CGRect
 
-    init(image: NSImage, pageBounds: CGRect, mode: PrintScaleMode) {
+    init(image: NSImage, pageBounds: CGRect, imageableBounds: CGRect) {
         self.image = image
-        self.pageBounds = pageBounds
-        self.mode = mode
+        self.imageableBounds = imageableBounds
         super.init(frame: pageBounds)
     }
 
@@ -42,19 +39,28 @@ final class PrintPageView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func draw(_ dirtyRect: NSRect) {
-        let page = pageBounds
-        let size = image.size
-        let rect: CGRect
-        switch mode {
-        case .fitPage:
-            let scale = min(page.width / size.width, page.height / size.height)
-            let w = size.width * scale
-            let h = size.height * scale
-            rect = CGRect(x: page.midX - w / 2, y: page.midY - h / 2, width: w, height: h)
-        case .actualSize:
-            rect = CGRect(x: page.midX - size.width / 2, y: page.midY - size.height / 2,
-                          width: size.width, height: size.height)
-        }
-        image.draw(in: rect)
+        // 用位图像素做适配基准:image.size 受 DPI 标注影响(3000px@150dpi=2000pt),
+        // 会让适配结果偏离像素语义;像素尺寸与打印面板预览的期望一致。
+        let rep = image.representations.first
+        let pixelWidth = CGFloat(rep?.pixelsWide ?? 0)
+        let pixelHeight = CGFloat(rep?.pixelsHigh ?? 0)
+        let imageSize = (pixelWidth > 0 && pixelHeight > 0)
+            ? CGSize(width: pixelWidth, height: pixelHeight)
+            : image.size
+        let page = imageableBounds
+
+        // 按可打印区域适配,保持宽高比
+        let scale = min(page.width / imageSize.width, page.height / imageSize.height)
+        let drawWidth = imageSize.width * scale
+        let drawHeight = imageSize.height * scale
+        let rect = CGRect(
+            x: page.midX - drawWidth / 2,
+            y: page.midY - drawHeight / 2,
+            width: drawWidth,
+            height: drawHeight
+        )
+
+        image.draw(in: rect, from: .zero, operation: .copy, fraction: 1,
+                   respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
     }
 }

@@ -63,6 +63,8 @@ final class FolderStore {
 
     /// folder -> 上次选中的图片,切回文件夹时恢复
     private var selectionMemory: [URL: URL] = [:]
+    /// folder -> 被隐藏的图片(会话级,不写盘;刷新/重开 app 后恢复)
+    private var hiddenByFolder: [URL: Set<URL>] = [:]
 
     var currentImage: ImageFile? {
         guard let id = selectedImageID else { return nil }
@@ -90,8 +92,8 @@ final class FolderStore {
 
     func openFolderPanel() {
         let panel = NSOpenPanel()
-        panel.title = "打开图片文件夹"
-        panel.message = "选择一个包含图片的文件夹"
+        panel.title = L10n.openFolderTitle
+        panel.message = L10n.openFolderMessage
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
@@ -115,7 +117,8 @@ final class FolderStore {
 
     func selectFolder(_ node: FolderNode) {
         selectedFolderID = node.id
-        images = ImageDiscovery.images(in: node.url)
+        let hidden = hiddenByFolder[node.url] ?? []
+        images = ImageDiscovery.images(in: node.url).filter { !hidden.contains($0.url) }
         if let remembered = selectionMemory[node.url],
            images.contains(where: { $0.id == remembered }) {
             selectedImageID = remembered
@@ -196,6 +199,58 @@ final class FolderStore {
     func requestCrop() {
         guard currentImage != nil else { return }
         cropRequestToken += 1
+    }
+
+    // MARK: - 缩略图右键操作(复制 / 隐藏 / 删除)
+
+    /// 复制图片:同时写入文件引用与图像数据
+    /// (Finder 粘贴得到文件拷贝,富文本/聊天应用粘贴得到图像)
+    func copyImageToPasteboard(_ id: ImageFile.ID) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.declareTypes([.fileURL, .tiff], owner: nil)
+        (id as NSURL).write(to: pasteboard)
+        guard let image = NSImage(contentsOf: id),
+              let tiff = image.tiffRepresentation else { return }
+        pasteboard.setData(tiff, forType: .tiff)
+    }
+
+    /// 隐藏图片:仅从当前浏览列表移除,文件保留在磁盘
+    func hideImage(_ id: ImageFile.ID) {
+        guard let folder = selectedFolder?.url,
+              images.contains(where: { $0.id == id }) else { return }
+        hiddenByFolder[folder, default: []].insert(id)
+        removeFromImages(id)
+    }
+
+    /// 删除图片:移到废纸篓(可从 Finder 恢复);失败时弹窗说明并保留在列表
+    func deleteImage(_ id: ImageFile.ID) {
+        guard images.contains(where: { $0.id == id }) else { return }
+        do {
+            try FileManager.default.trashItem(at: id, resultingItemURL: nil)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "无法将“\(id.lastPathComponent)”移到废纸篓"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+            return
+        }
+        removeFromImages(id)
+    }
+
+    /// 从浏览列表移除一张图;若被移除的是当前图,选中同位置的后继项
+    private func removeFromImages(_ id: ImageFile.ID) {
+        guard let index = images.firstIndex(where: { $0.id == id }) else { return }
+        let wasSelected = selectedImageID == id
+        images.remove(at: index)
+        guard wasSelected else { return }
+        if images.isEmpty {
+            selectedImageID = nil
+        } else {
+            selectImage(images[min(index, images.count - 1)].id)
+        }
+        if let folder = selectedFolder?.url {
+            selectionMemory[folder] = selectedImageID
+        }
     }
 
     // MARK: - 私有
