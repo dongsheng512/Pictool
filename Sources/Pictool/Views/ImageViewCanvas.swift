@@ -118,8 +118,8 @@ struct ImageViewCanvas: NSViewRepresentable {
             clipView.onStep = { [weak self] delta in
                 self?.parent.onStep(delta)
             }
-            clipView.onHorizontalSwipe = { [weak self] direction in
-                self?.parent.onStep(direction > 0 ? 1 : -1)
+            clipView.onHorizontalSwipe = { [weak self] step in
+                self?.parent.onStep(step)
             }
             clipView.onLayoutChange = { [weak self] in
                 self?.handleLayout()
@@ -171,8 +171,9 @@ struct ImageViewCanvas: NSViewRepresentable {
             applyScale(scale * m, anchor: visibleCenter(), resetMagnification: true)
         }
 
-        /// 自测:模拟一次捏合结束
+        /// 自测:模拟一次捏合结束(仅 Debug 构建编译)
         private func setupSelfTestHooks() {
+#if DEBUG
             guard ProcessInfo.processInfo.arguments.contains("--zoom-test") else { return }
             NotificationCenter.default.addObserver(
                 forName: Notification.Name("PictoolSimPinch"), object: nil, queue: .main
@@ -186,6 +187,7 @@ struct ImageViewCanvas: NSViewRepresentable {
                     self.lateCheck("afterSimPinch")
                 }
             }
+#endif
         }
 
         // MARK: 加载
@@ -780,8 +782,8 @@ final class CanvasClipView: NSClipView {
     var onStep: ((Int) -> Void)?
     var onLayoutChange: (() -> Void)?
     var onSmartZoom: (() -> Void)?
-    /// 触控板双指横滑切图(仅图片水平方向无溢出时启用)
-    var onHorizontalSwipe: ((CGFloat) -> Void)?
+    /// 横滑切图提交。方向语义全项目统一:+1 = 下一张,-1 = 上一张
+    var onHorizontalSwipe: ((Int) -> Void)?
     /// applyDocument 写入期间锁定 origin,防止 constrain 在同一拍改掉取景
     var pinnedOrigin: NSPoint?
 
@@ -814,7 +816,8 @@ final class CanvasClipView: NSClipView {
            event.phase != .ended, event.momentumPhase == [] {
             swipeGestureActive = true
             swipeAccumulatedDX += dx   // 自然滚动:内容左移(dx>0)= 看下一张
-            // 一个手势只提交一张 + 两次提交至少隔 0.3s,双保险防长滑连切
+            // 一个手势只提交一张 + 两次提交至少隔 0.3s,双保险防长滑连切。
+            // 方向换算收口在事件源:自然滚动 dx>0(内容左移)= 看下一张
             let now = CACurrentMediaTime()
             if !swipeCommittedThisGesture,
                now - lastSwipeCommitTime >= Self.swipeCommitMinInterval,
@@ -895,7 +898,7 @@ final class CanvasImageView: NSImageView {
 
     var onDoubleClick: (() -> Void)?
     var onPan: ((CGSize) -> Void)?
-    /// 滑动切图提交:>0 右划(上一张),<0 左划(下一张);仅越阈值时回调
+    /// 滑动切图提交。方向语义全项目统一:+1 = 下一张,-1 = 上一张
     var onSwipe: ((Int) -> Void)?
 
     private enum DragMode { case undecided, pan, swipe }
@@ -1007,7 +1010,7 @@ final class CanvasImageView: NSImageView {
     override func mouseUp(with event: NSEvent) {
         defer { resetDragState() }
         guard dragMode == .swipe, abs(swipeTotalDX) >= Self.swipeCommitThreshold else { return }
-        // 向右拖(dx>0)= 看上一张;向左拖 = 看下一张
+        // 方向换算收口在事件源:向右拖(dx>0)= 上一张,向左拖 = 下一张
         onSwipe?(swipeTotalDX > 0 ? -1 : 1)
     }
 

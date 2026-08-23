@@ -346,6 +346,7 @@ struct MainContentView: View {
     // MARK: 自测模式(--zoom-test):自动执行一组缩放动作并记录日志
 
     private func runZoomSelfTestIfRequested() {
+#if DEBUG
         guard ProcessInfo.processInfo.arguments.contains("--zoom-test") else { return }
         Task { @MainActor in
             let wait: UInt64 = 1_200_000_000
@@ -366,6 +367,7 @@ struct MainContentView: View {
             try? await Task.sleep(nanoseconds: wait)
             FileHandle.standardError.write(Data("[test] DONE\n".utf8))
         }
+#endif
     }
 
     // MARK: 拖放 / 外部打开
