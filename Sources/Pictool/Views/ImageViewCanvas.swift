@@ -87,6 +87,13 @@ struct ImageViewCanvas: NSViewRepresentable {
         private var lastNotifiedPercent = Int.min
         private var escalateWork: DispatchWorkItem?
 
+        deinit {
+            loadTask?.cancel()
+            animState.advance()
+            animationTask?.cancel()
+            escalateWork?.cancel()
+        }
+
         init(_ parent: ImageViewCanvas) {
             self.parent = parent
 
@@ -963,6 +970,11 @@ final class CanvasImageView: NSImageView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        syncLayer()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
         syncLayer()
     }
 

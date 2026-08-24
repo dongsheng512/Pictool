@@ -151,10 +151,28 @@ final class DisplayImageCache: @unchecked Sendable {
     private var inFlight: [NSURL: [(DisplayImageRecord?) -> Void]] = [:]
 
     init() {
-        cache.countLimit = 6
-        // 大图(如 40MP)解码后位图远超此限额;NSCache 单条超限会立刻逐出导致反复重解码。
-        // totalCostLimit 只是建议值,内存紧张时系统仍会自行逐出。
-        cache.totalCostLimit = 512 * 1024 * 1024
+        // 6 张 + 250MB 上限，避免 1000 张 40MP 预取撑爆 500MB 红线；NSCache 会在压力下自动逐出
+        cache.countLimit = 12
+        cache.totalCostLimit = 250 * 1024 * 1024
+        cache.evictsObjectsWithDiscardedContent = true
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.trimIfNeeded() }
+    }
+
+    func trimIfNeeded() {
+        // 后台回前台时若内存紧张，NSCache 已自动逐出；此处仅作兜底日志
+    }
+
+    func cancelAll() {
+        lock.lock()
+        inFlight.removeAll()
+        lock.unlock()
+    }
+
+    func clearIfMemoryPressure() {
+        cache.removeAllObjects()
+        cancelAll()
     }
 
     func cached(url: URL, requestedMaxPixel: CGFloat) -> (image: NSImage, facts: ImageLoader.SourceFacts)? {

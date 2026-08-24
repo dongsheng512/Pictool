@@ -10,7 +10,7 @@ struct MainContentView: View {
     @State private var showCropSheet = false
     @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
-    @State private var sidebarWidth: CGFloat = 260
+    @State private var sidebarWidth: CGFloat = UserDefaults.standard.double(forKey: "sidebarWidth") > 0 ? UserDefaults.standard.double(forKey: "sidebarWidth") : 260
     @State private var dragStartWidth: CGFloat = 260
     @State private var isHoveringDivider = false
     @AppStorage(CanvasBackground.storageKey) private var canvasBackgroundRaw = CanvasBackground.defaultValue.rawValue
@@ -104,7 +104,7 @@ struct MainContentView: View {
                                             let next = dragStartWidth + value.translation.width
                                             sidebarWidth = min(400, max(180, next))
                                         }
-                                        .onEnded { _ in dragStartWidth = sidebarWidth }
+                                        .onEnded { _ in dragStartWidth = sidebarWidth; UserDefaults.standard.set(sidebarWidth, forKey: "sidebarWidth") }
                                 )
                                 .onHover { inside in
                                     isHoveringDivider = inside
@@ -139,6 +139,10 @@ struct MainContentView: View {
                 .frame(maxWidth: .infinity, alignment: .top)
         }
         .ignoresSafeArea(edges: .top)
+        .onDisappear {
+            NSApp.keyWindow?.isMovableByWindowBackground = true
+            NSApp.mainWindow?.isMovableByWindowBackground = true
+        }
     }
 
     private func prepareAndPrint() {

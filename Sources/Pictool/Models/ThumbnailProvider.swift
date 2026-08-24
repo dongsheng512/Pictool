@@ -11,7 +11,7 @@ final class ThumbnailProvider: @unchecked Sendable {
         let q = OperationQueue()
         q.name = "pictool.thumbnails"
         q.maxConcurrentOperationCount = 2
-        q.qualityOfService = .userInitiated
+        q.qualityOfService = .utility
         return q
     }()
     private let lock = NSLock()
@@ -44,8 +44,14 @@ final class ThumbnailProvider: @unchecked Sendable {
             guard let self else { return }
             let image = Self.generate(url: url, maxPixel: maxPixel)
             if let image {
-                let cost = Int(image.size.width * image.size.height * 4)
-                self.cache.setObject(image, forKey: key, cost: cost)
+                // 精确 cost：用 CG 位图像素，避免 NSImage.size 为 points 时低估 4x
+                let cost: Int
+                if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    cost = cg.bytesPerRow * cg.height
+                } else {
+                    cost = Int(image.size.width * image.size.height * 4)
+                }
+                self.cache.setObject(image, forKey: key, cost: max(cost, 1))
             }
             self.lock.lock()
             let waiters = self.inFlight.removeValue(forKey: key) ?? []
@@ -64,7 +70,17 @@ final class ThumbnailProvider: @unchecked Sendable {
     static func generate(url: URL, maxPixel: CGFloat) -> NSImage? {
         let srcOpts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let source = CGImageSourceCreateWithURL(url as CFURL, srcOpts as CFDictionary) else { return nil }
-        // IfAbsent: JPEG/RAW 优先用内嵌预览,侧栏 180px 足够且远快于整图解码
+        // 先尝试内嵌缩略图（IfAbsent:false），命中则零解码、极快；未命中再回退整图解码
+        let fastOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageIfAbsent: false,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceShouldCache: false,
+        ]
+        if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, fastOpts as CFDictionary) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -74,5 +90,12 @@ final class ThumbnailProvider: @unchecked Sendable {
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    func cancelAll() {
+        queue.cancelAllOperations()
+        lock.lock()
+        inFlight.removeAll()
+        lock.unlock()
     }
 }

@@ -159,12 +159,13 @@ private struct WindowControls: View {
             Button {
                 if let w = window {
                     w.close()
+                    // 仅当关闭的是最后一个可见普通窗口时才退出，避免 Inspector/预览窗口误杀
                     DispatchQueue.main.async {
-                        if NSApp.windows.filter(\.isVisible).isEmpty { NSApp.terminate(nil) }
+                        let visibleNormal = NSApp.windows.filter { $0.isVisible && $0.level == .normal && $0.styleMask.contains(.titled) }
+                        if visibleNormal.isEmpty { NSApp.terminate(nil) }
                     }
                 } else {
                     dismiss()
-                    NSApp.terminate(nil)
                 }
             } label: {
                 ZStack {

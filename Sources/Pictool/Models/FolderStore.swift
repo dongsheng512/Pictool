@@ -83,10 +83,22 @@ final class FolderStore {
     private(set) var zoomRequest: (action: ZoomAction, token: Int)?
     private var zoomToken = 0
 
-    /// folder -> 上次选中的图片,切回文件夹时恢复
+    /// folder -> 上次选中的图片,切回文件夹时恢复（key 已 standardized）
     private var selectionMemory: [URL: URL] = [:]
-    /// folder -> 被隐藏的图片(会话级,不写盘;刷新/重开 app 后恢复)
+    /// folder -> 被隐藏的图片(会话级,不写盘;刷新/重开 app 后恢复，最多 100 文件夹 LRU)
     private var hiddenByFolder: [URL: Set<URL>] = [:]
+    private var hiddenByFolderOrder: [URL] = []
+
+    private func standardized(_ url: URL) -> URL { url.standardizedFileURL }
+    private func rememberHidden(folder: URL, id: URL) {
+        let key = standardized(folder)
+        if hiddenByFolder[key] == nil { hiddenByFolderOrder.append(key) }
+        hiddenByFolder[key, default: []].insert(standardized(id))
+        if hiddenByFolderOrder.count > 100, let oldest = hiddenByFolderOrder.first {
+            hiddenByFolderOrder.removeFirst()
+            hiddenByFolder.removeValue(forKey: oldest)
+        }
+    }
 
     var currentImage: ImageFile? {
         guard let id = selectedImageID else { return nil }
@@ -95,7 +107,7 @@ final class FolderStore {
 
     /// 当前图前后各 1 张,供主视图预解码
     var neighborURLs: [URL] {
-        guard selectedImageID != nil, !images.isEmpty else { return [] }
+        guard selectedImageID != nil, !images.isEmpty, currentIndex >= 0 else { return [] }
         return [-1, 1].compactMap { offset in
             let idx = currentIndex + offset
             guard images.indices.contains(idx) else { return nil }
@@ -104,8 +116,8 @@ final class FolderStore {
     }
 
     var currentIndex: Int {
-        guard let id = selectedImageID else { return 0 }
-        return images.firstIndex { $0.id == id } ?? 0
+        guard let id = selectedImageID else { return -1 }
+        return images.firstIndex { $0.id == id } ?? -1
     }
 
     var selectedFolder: FolderNode? { node(id: selectedFolderID) }
@@ -139,30 +151,38 @@ final class FolderStore {
 
     func selectFolder(_ node: FolderNode) {
         selectedFolderID = node.id
-        let hidden = hiddenByFolder[node.url] ?? []
-        images = ImageDiscovery.images(in: node.url).filter { !hidden.contains($0.url) }
-        if let remembered = selectionMemory[node.url],
-           images.contains(where: { $0.id == remembered }) {
+        let key = standardized(node.url)
+        let hidden = hiddenByFolder[key] ?? []
+        // 取消旧缩略图队列，避免 1000 张切盘时积压
+        ThumbnailProvider.shared.cancelAll()
+        DisplayImageCache.shared.cancelAll()
+        images = ImageDiscovery.images(in: node.url).filter { !hidden.contains(standardized($0.url)) }
+        if let remembered = selectionMemory[key],
+           images.contains(where: { standardized($0.id) == remembered }) {
             selectedImageID = remembered
         } else {
             selectedImageID = images.first?.id
         }
+        if let sel = selectedImageID { selectionMemory[key] = standardized(sel) }
         prefetchNeighbors()
     }
 
-    func selectImage(_ id: ImageFile.ID, direction: Int = 0) {
+        func selectImage(_ id: ImageFile.ID, direction: Int = 0) {
         guard images.contains(where: { $0.id == id }) else { return }
         selectedImageID = id
         lastStepDirection = direction
         if let folder = selectedFolder?.url {
-            selectionMemory[folder] = id
+            selectionMemory[standardized(folder)] = standardized(id)
         }
         prefetchNeighbors()
     }
 
     /// 步进切换(首尾循环)
     func step(_ delta: Int) {
-        guard !images.isEmpty else { return }
+        guard !images.isEmpty, currentIndex >= 0 else {
+            if !images.isEmpty { selectImage(images[0].id, direction: delta) }
+            return
+        }
         let count = images.count
         let idx = ((currentIndex + delta) % count + count) % count
         lastStepDirection = delta > 0 ? 1 : (delta < 0 ? -1 : 0)
@@ -240,7 +260,7 @@ final class FolderStore {
     func hideImage(_ id: ImageFile.ID) {
         guard let folder = selectedFolder?.url,
               images.contains(where: { $0.id == id }) else { return }
-        hiddenByFolder[folder, default: []].insert(id)
+        rememberHidden(folder: folder, id: id)
         removeFromImages(id)
     }
 
@@ -271,7 +291,9 @@ final class FolderStore {
             selectImage(images[min(index, images.count - 1)].id)
         }
         if let folder = selectedFolder?.url {
-            selectionMemory[folder] = selectedImageID
+            let key = standardized(folder)
+            if let sel = selectedImageID { selectionMemory[key] = standardized(sel) }
+            else { selectionMemory.removeValue(forKey: key) }
         }
     }
 
