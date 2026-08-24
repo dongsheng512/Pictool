@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 左侧边栏:上半区项目文件夹树,下半区当前文件夹的缩略图网格
 struct SidebarView: View {
@@ -11,24 +12,31 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             folderTree
-            Divider()
-            ThumbnailGridView(expanded: $thumbnailsExpanded)
+            if !store.roots.isEmpty {
+                ThumbnailGridView(expanded: $thumbnailsExpanded)
+            }
         }
         .animation(.easeInOut(duration: 0.22), value: thumbnailsExpanded)
-        .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 440)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+        ZStack {
+            SidebarMaterial()
+            // 柔化磨砂：轻微提亮，让侧栏在浅色模式下更通透、不发灰
+            Color.white.opacity(0.30)
+        }
+    }
     }
 
     private var folderTree: some View {
         Group {
             if store.roots.isEmpty {
                 VStack(spacing: 10) {
-                    Image(systemName: "folder.badge.plus")
+                    Image(systemName: "folder")
                         .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
                     Text("尚未打开文件夹")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    Button("打开文件夹…") { store.openFolderPanel() }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -39,9 +47,13 @@ struct SidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
             }
         }
-        .frame(minHeight: 110, maxHeight: thumbnailsExpanded ? 110 : 340)
+        .frame(
+            minHeight: 110,
+            maxHeight: store.roots.isEmpty ? .infinity : (thumbnailsExpanded ? 110 : 340)
+        )
     }
 
     private var selectionBinding: Binding<FolderNode.ID?> {
@@ -53,6 +65,36 @@ struct SidebarView: View {
             }
         )
     }
+}
+
+struct SidebarWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 200
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+/// Finder 同款侧栏材质(顶栏左侧与侧栏共用)
+struct SidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        // 保持跟随系统外观，浅色下更通透
+        return view
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+/// 顶栏右侧（主区）的磨砂材质，与主区柔和白底呼应
+struct HeaderMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .headerView
+        view.blendingMode = .withinWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 struct FolderTreeRow: View {

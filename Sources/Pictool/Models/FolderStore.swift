@@ -45,6 +45,28 @@ final class FolderStore {
     var displayInfo = DisplayImageInfo()
 
     var showInspector = false
+    /// 只看图:窗口内隐藏顶栏/侧栏/状态栏/信息面板
+    var isImmersive = false
+    /// 侧栏是否可见(普通模式;纯净模式下强制隐藏,退出后恢复)
+    var sidebarVisible = true
+    private var sidebarBeforeImmersive = true
+
+    func toggleImmersive() {
+        if !isImmersive, currentImage == nil { return }
+        isImmersive.toggle()
+        if isImmersive {
+            showInspector = false
+            sidebarBeforeImmersive = sidebarVisible
+            sidebarVisible = false
+        } else {
+            sidebarVisible = sidebarBeforeImmersive
+        }
+    }
+
+    func toggleSidebar() {
+        guard !isImmersive else { return }
+        sidebarVisible.toggle()
+    }
     private(set) var printRequestToken = 0
     private(set) var cropRequestToken = 0
     /// 旋转指令通道(token 递增表示新指令;旋转是显示层状态,不写回文件)

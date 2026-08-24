@@ -3,32 +3,31 @@ import AppKit
 @MainActor
 enum PrintService {
 
-    /// 使用标准打印面板打印图片。方向与缩放百分比由原生打印面板设置。
-    /// 图像默认适配可打印区域并居中;Scaling 控件在此基础上做相对百分比调整。
+    /// 标准打印面板:视图按图片点尺寸排版,缩放百分比由 AppKit 作用到预览。
+    /// 100% = 原图 72dpi 实际大小;打开时把百分比设为「刚好铺满当前纸张」,之后拖动即按正常百分比缩放。
     static func print(image: NSImage) {
-        // NSPrintInfo.shared 是全局持久状态(上次作业的方向/纸张会残留),
-        // 必须拷贝一份再改,避免污染用户的全局打印预设,也避免旧状态串台本次作业。
         let info = NSPrintInfo.shared.copy() as! NSPrintInfo
-        info.horizontalPagination = .fit
-        info.verticalPagination = .fit
-        info.scalingFactor = 1.0
+        info.horizontalPagination = .clip
+        info.verticalPagination = .clip
         info.isVerticallyCentered = true
         info.isHorizontallyCentered = true
-        // 按图片宽高比预置方向:横图横排、竖图竖排,减少跨页误判
-        let rep = image.representations.first
-        let pw = rep?.pixelsWide ?? 0
-        let ph = rep?.pixelsHigh ?? 0
-        if pw > 0, ph > 0 {
-            info.orientation = pw >= ph ? .landscape : .portrait
+        // 原生缩放本身不要求留白。边距 0,初始百分比按整张纸计算,避免「可印区域」
+        // (打印机硬件边 + 默认 1 英寸页边)把图缩在纸心。
+        info.leftMargin = 0
+        info.rightMargin = 0
+        info.topMargin = 0
+        info.bottomMargin = 0
+
+        let imgSize = PrintPageView.imageAspect(image)
+        if imgSize.width > 0, imgSize.height > 0 {
+            info.orientation = imgSize.width >= imgSize.height ? .landscape : .portrait
         }
 
-        // view frame 用最终 paperSize(方向已定),保证分页尺寸与绘制范围一致,
-        // 不会因「view 尺寸 ≠ 页面尺寸」被切成多页
-        let pageFrame = CGRect(origin: .zero, size: info.paperSize)
-        let imageable = info.imageablePageBounds
-        let view = PrintPageView(image: image, pageBounds: pageFrame, imageableBounds: imageable)
+        info.scalingFactor = PrintPageView.fitScale(imageSize: imgSize, paperSize: info.paperSize)
+
+        let view = PrintPageView(image: image)
         let operation = NSPrintOperation(view: view, printInfo: info)
-        operation.canSpawnSeparateThread = true
+        operation.canSpawnSeparateThread = false
         operation.printPanel.options.insert([.showsOrientation, .showsScaling])
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
             operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
@@ -36,44 +35,43 @@ enum PrintService {
     }
 }
 
-/// 整页绘制视图:图像按可打印区域适配缩放后居中,预览和输出一致。
+/// 文档就是图片本身。分页/缩放交给 NSPrintOperation,预览才能跟着百分比走。
 final class PrintPageView: NSView {
 
     private let image: NSImage
-    private let imageableBounds: CGRect
 
-    init(image: NSImage, pageBounds: CGRect, imageableBounds: CGRect) {
+    init(image: NSImage) {
         self.image = image
-        self.imageableBounds = imageableBounds
-        super.init(frame: pageBounds)
+        let size = Self.imageAspect(image)
+        super.init(frame: NSRect(origin: .zero, size: size))
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func draw(_ dirtyRect: NSRect) {
-        // 用位图像素做适配基准:image.size 受 DPI 标注影响(3000px@150dpi=2000pt),
-        // 会让适配结果偏离像素语义;像素尺寸与打印面板预览的期望一致。
-        let rep = image.representations.first
-        let pixelWidth = CGFloat(rep?.pixelsWide ?? 0)
-        let pixelHeight = CGFloat(rep?.pixelsHigh ?? 0)
-        let imageSize = (pixelWidth > 0 && pixelHeight > 0)
-            ? CGSize(width: pixelWidth, height: pixelHeight)
-            : image.size
-        let page = imageableBounds
-
-        // 按可打印区域适配,保持宽高比
-        let scale = min(page.width / imageSize.width, page.height / imageSize.height)
-        let drawWidth = imageSize.width * scale
-        let drawHeight = imageSize.height * scale
-        let rect = CGRect(
-            x: page.midX - drawWidth / 2,
-            y: page.midY - drawHeight / 2,
-            width: drawWidth,
-            height: drawHeight
+        image.draw(
+            in: bounds,
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .copy,
+            fraction: 1,
+            respectFlipped: false,
+            hints: [.interpolation: NSImageInterpolation.high]
         )
+    }
 
-        image.draw(in: rect, from: .zero, operation: .copy, fraction: 1,
-                   respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
+    static func imageAspect(_ image: NSImage) -> NSSize {
+        if let rep = image.representations.first, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+            return NSSize(width: CGFloat(rep.pixelsWide), height: CGFloat(rep.pixelsHigh))
+        }
+        return image.size
+    }
+
+    /// 铺满整张纸所需的缩放(面板百分比 = 此值 × 100)
+    static func fitScale(imageSize: NSSize, paperSize: NSSize) -> CGFloat {
+        guard imageSize.width > 0, imageSize.height > 0, paperSize.width > 0, paperSize.height > 0 else {
+            return 1
+        }
+        return min(paperSize.width / imageSize.width, paperSize.height / imageSize.height)
     }
 }

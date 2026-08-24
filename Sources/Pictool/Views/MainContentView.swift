@@ -2,36 +2,34 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// 主界面:NavigationSplitView(边栏 + 详情)+ 尾随信息面板 + 底部状态栏
+/// 主界面:纯 SwiftUI——hiddenTitleBar 无系统 header,
+/// NavigationSplitView(侧栏 + 详情)+ 自定义 Overlay header + 信息面板 + 状态栏
 struct MainContentView: View {
 
     @Environment(FolderStore.self) private var store
     @State private var showCropSheet = false
     @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
+    @State private var sidebarWidth: CGFloat = 260
+    @State private var dragStartWidth: CGFloat = 260
+    @State private var isHoveringDivider = false
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackgroundRaw = CanvasBackground.defaultValue.rawValue
 
     var body: some View {
         @Bindable var store = store
-        NavigationSplitView {
-            SidebarView()
-        } detail: {
-            detail
-                .inspector(isPresented: $store.showInspector) {
-                    InfoInspector(file: store.currentImage)
-                }
-                .toolbar { toolbarContent }
-                .sheet(isPresented: $showCropSheet) {
-                    if let file = store.currentImage { CropView(file: file) }
-                }
-                .onChange(of: store.cropRequestToken) { _, _ in
-                    showCropSheet = store.currentImage != nil
-                }
-                .onChange(of: store.printRequestToken) { _, _ in
-                    prepareAndPrint()
-                }
+        Group {
+            if store.isImmersive {
+                immersiveLayer
+            } else {
+                normalLayer
+            }
         }
         .frame(minWidth: 960, minHeight: 600)
-        .onAppear { runZoomSelfTestIfRequested() }
+        .background(WindowChrome(immersive: store.isImmersive))
+        .onAppear {
+            runZoomSelfTestIfRequested()
+            dragStartWidth = sidebarWidth
+        }
         .onOpenURL { url in handleExternal(url) }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleDrop(providers)
@@ -39,6 +37,108 @@ struct MainContentView: View {
         .overlay {
             if isPreparingPrint { ProgressView("正在准备打印…") }
         }
+        .overlay(alignment: .topTrailing) {
+            if store.isImmersive {
+                Button {
+                    store.toggleImmersive()
+                } label: {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 28, height: 22)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
+                }
+                .buttonStyle(.plain)
+                .help("退出只看图 (Esc)")
+                .padding(12)
+            }
+        }
+        .onExitCommand {
+            if store.isImmersive { store.toggleImmersive() }
+        }
+    }
+
+    // MARK: - 纯净模式单独显示层：只显示图片，无任何 chrome
+    private var immersiveLayer: some View {
+        ZStack {
+            ImageViewCanvas(
+                file: store.currentImage,
+                neighborURLs: store.neighborURLs,
+                backgroundColor: CanvasBackground(rawValue: canvasBackgroundRaw)?.color
+                    ?? CanvasBackground.defaultValue.color,
+                zoomRequest: store.zoomRequest,
+                rotateRequestToken: store.rotateRequestToken,
+                stepDirection: store.lastStepDirection,
+                onLoadingChange: { store.imageLoading = $0 },
+                onScaleChange: { store.displayScale = $0 },
+                onImageInfo: { store.displayInfo = $0 },
+                onStep: { store.step($0) }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+    }
+
+    private var normalLayer: some View {
+        ZStack(alignment: .top) {
+            HStack(spacing: 0) {
+                if store.sidebarVisible {
+                    SidebarView()
+                        .frame(width: sidebarWidth)
+                        // 1px 分隔线贴在侧栏右边缘
+                        .overlay(alignment: .trailing) {
+                            Rectangle()
+                                .fill(isHoveringDivider ? Color.black.opacity(0.14) : Color.black.opacity(0.07))
+                                .frame(width: 1)
+                        }
+                        // 16pt 拖拽热区，居中于分隔线上（左右各 8pt），便于抓取
+                        .overlay(alignment: .trailing) {
+                            Color.clear
+                                .frame(width: 16)
+                                .contentShape(Rectangle())
+                                .offset(x: 8)
+                                .highPriorityGesture(
+                                    DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                                        .onChanged { value in
+                                            let next = dragStartWidth + value.translation.width
+                                            sidebarWidth = min(400, max(180, next))
+                                        }
+                                        .onEnded { _ in dragStartWidth = sidebarWidth }
+                                )
+                                .onHover { inside in
+                                    isHoveringDivider = inside
+                                    if let w = NSApp.keyWindow ?? NSApp.mainWindow {
+                                        w.isMovableByWindowBackground = !inside
+                                    }
+                                    if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                                }
+                        }
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .inspector(isPresented: Binding(get: { store.showInspector }, set: { store.showInspector = $0 })) {
+                        InfoInspector(file: store.currentImage)
+                    }
+                    .sheet(isPresented: $showCropSheet) {
+                        if let file = store.currentImage { CropView(file: file) }
+                    }
+                    .onChange(of: store.cropRequestToken) { _, _ in
+                        showCropSheet = store.currentImage != nil
+                    }
+                    .onChange(of: store.printRequestToken) { _, _ in
+                        prepareAndPrint()
+                    }
+            }
+            .padding(.top, 32)
+            PureHeader(
+                sidebarWidth: store.sidebarVisible ? sidebarWidth : nil,
+                sidebarVisible: store.sidebarVisible
+            )
+                .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .ignoresSafeArea(edges: .top)
     }
 
     private func prepareAndPrint() {
@@ -65,6 +165,8 @@ struct MainContentView: View {
                 ImageViewCanvas(
                     file: store.currentImage,
                     neighborURLs: store.neighborURLs,
+                    backgroundColor: CanvasBackground(rawValue: canvasBackgroundRaw)?.color
+                        ?? CanvasBackground.defaultValue.color,
                     zoomRequest: store.zoomRequest,
                     rotateRequestToken: store.rotateRequestToken,
                     stepDirection: store.lastStepDirection,
@@ -91,8 +193,9 @@ struct MainContentView: View {
                     }
                 }
             }
-            Divider()
-            statusBar
+            if !store.isImmersive {
+                statusBar
+            }
         }
         // 缩放下拉用窗口内 overlay 实现,保证弹出面板被窗口边界裁剪
         .overlay {
@@ -126,7 +229,7 @@ struct MainContentView: View {
                 .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(FrostedWhiteBackground())
+        .background(SoftWhiteOverlay())
     }
 
     /// 缩放下拉的菜单项(悬停高亮)
@@ -158,19 +261,27 @@ struct MainContentView: View {
         }
     }
 
-    /// 磨砂感白色底(NSVisualEffectView 浅色材质),用于未打开图片的初始状态
+    /// 柔和磨砂白底，与侧栏/header 形成同色系过渡，避免纯白刺眼
     private struct FrostedWhiteBackground: NSViewRepresentable {
         func makeNSView(context: Context) -> NSVisualEffectView {
             let view = NSVisualEffectView()
-            view.material = .contentBackground
-            view.blendingMode = .behindWindow
-            view.state = .active
-            // 固定浅色外观,深色系统主题下也保持白色磨砂
-            view.appearance = NSAppearance(named: .vibrantLight)
+            view.material = .headerView
+            view.blendingMode = .withinWindow
+            view.state = .followsWindowActiveState
             return view
         }
 
         func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+    }
+
+    private struct SoftWhiteOverlay: View {
+        var body: some View {
+            ZStack {
+                FrostedWhiteBackground()
+                // 柔和米白提亮，#FAFAFB @ 0.72
+                Color(red: 0.985, green: 0.985, blue: 0.987).opacity(0.22)
+            }
+        }
     }
 
     private var statusBar: some View {
@@ -217,6 +328,12 @@ struct MainContentView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .background {
+            ZStack {
+                HeaderMaterial()
+                Color.white.opacity(0.22)
+            }
+        }
     }
 
     /// 元数据段:格式 / 像素尺寸 / 动图帧数(按可用性拼接)
@@ -275,90 +392,6 @@ struct MainContentView: View {
         .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
     }
 
-    // MARK: 工具栏
-
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            Button {
-                store.openFolderPanel()
-            } label: {
-                Label("打开文件夹", systemImage: "folder.badge.plus")
-            }
-            .help("打开图片文件夹 (⌘O)")
-        }
-        ToolbarItem(placement: .navigation) {
-            Button {
-                store.refreshCurrentFolder()
-            } label: {
-                Label("刷新", systemImage: "arrow.clockwise")
-            }
-            .help("刷新当前文件夹 (⌘R)")
-            .disabled(store.selectedFolder == nil)
-        }
-
-        ToolbarItemGroup {
-            Button { store.step(-1) } label: {
-                Label("上一张", systemImage: "chevron.left")
-            }
-            .help("上一张 (←)")
-            .disabled(store.images.isEmpty)
-
-            Button { store.step(1) } label: {
-                Label("下一张", systemImage: "chevron.right")
-            }
-            .help("下一张 (→)")
-            .disabled(store.images.isEmpty)
-
-            Divider()
-
-            Button { store.requestZoom(.zoomOut) } label: {
-                Label("缩小", systemImage: "minus.magnifyingglass")
-            }
-            .help("缩小 (⌘-)")
-            .disabled(store.currentImage == nil)
-
-            Button { store.requestZoom(.zoomIn) } label: {
-                Label("放大", systemImage: "plus.magnifyingglass")
-            }
-            .help("放大 (⌘=)")
-            .disabled(store.currentImage == nil)
-        }
-
-        ToolbarItemGroup(placement: .primaryAction) {
-            Button {
-                store.requestRotate()
-            } label: {
-                Label("旋转", systemImage: "rotate.right")
-            }
-            .help("顺时针旋转 90°")
-            .disabled(store.currentImage == nil)
-
-            Button {
-                store.showInspector.toggle()
-            } label: {
-                Label("信息", systemImage: "info.circle")
-            }
-            .help("图片信息 (I)")
-
-            Button {
-                store.requestCrop()
-            } label: {
-                Label("裁切", systemImage: "crop")
-            }
-            .help("裁切 (C)")
-            .disabled(store.currentImage == nil)
-
-            Button {
-                store.requestPrint()
-            } label: {
-                Label("打印", systemImage: "printer")
-            }
-            .help("打印 (⌘P)")
-            .disabled(store.currentImage == nil)
-        }
-    }
-
     // MARK: 自测模式(--zoom-test):自动执行一组缩放动作并记录日志
 
     private func runZoomSelfTestIfRequested() {
@@ -409,3 +442,52 @@ struct MainContentView: View {
         return true
     }
 }
+
+/// 窗口 chrome：移除原生标题栏，仅保留 PureHeader 单层
+private struct WindowChrome: NSViewRepresentable {
+    let immersive: Bool
+    func makeNSView(context: Context) -> NSView { ChromeView() }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? ChromeView)?.immersive = immersive
+        (nsView as? ChromeView)?.apply()
+    }
+}
+private final class ChromeView: NSView {
+    var immersive = false
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        apply()
+        DispatchQueue.main.async { [weak self] in self?.stripTitlebar() }
+    }
+    override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); apply() }
+    func apply() { stripTitlebar() }
+    private func stripTitlebar() {
+        guard let window else { return }
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.title = ""
+        window.isMovableByWindowBackground = true
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        let radius: CGFloat = immersive ? 0 : 10
+        window.contentView?.wantsLayer = true
+        window.contentView?.layer?.cornerRadius = radius
+        window.contentView?.layer?.masksToBounds = true
+        window.contentView?.superview?.wantsLayer = true
+        window.contentView?.superview?.layer?.cornerRadius = radius
+        window.contentView?.superview?.layer?.masksToBounds = true
+        // 隐藏原生红绿灯（PureHeader 已自绘）；纯净模式直接隐藏整个原生标题栏，不留透明条
+        for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(b)?.isHidden = true
+        }
+        window.standardWindowButton(.closeButton)?.superview?.isHidden = true
+        if let theme = window.contentView?.superview {
+            for sub in theme.subviews where String(describing: type(of: sub)).contains("Titlebar") {
+                sub.isHidden = immersive
+                sub.frame.size.height = immersive ? 0 : 28
+            }
+        }
+    }
+}
+

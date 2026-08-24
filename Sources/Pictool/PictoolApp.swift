@@ -6,13 +6,16 @@ struct PictoolApp: App {
     @State private var store = FolderStore()
 
     var body: some Scene {
-        Window("PureView", id: "main") {
+        WindowGroup {
             MainContentView()
                 .environment(store)
+                .ignoresSafeArea(.container, edges: .top)
         }
-        .defaultSize(width: 1200, height: 760)
-        // 紧凑工具栏,降低顶部高度
-        .windowToolbarStyle(.unifiedCompact)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1024, height: 680)
+        Settings {
+            SettingsView()
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("打开文件夹…") { store.openFolderPanel() }
@@ -45,6 +48,11 @@ struct PictoolApp: App {
                 Divider()
                 Button("信息面板") { store.showInspector.toggle() }
                     .keyboardShortcut("i", modifiers: [])
+                Button(store.isImmersive ? "退出只看图" : "只看图") {
+                    store.toggleImmersive()
+                }
+                    .keyboardShortcut("f", modifiers: [])
+                    .disabled(store.currentImage == nil && !store.isImmersive)
                 Button("裁切…") { store.requestCrop() }
                     .keyboardShortcut("c", modifiers: [])
                     .disabled(store.currentImage == nil)

@@ -7,7 +7,7 @@ struct ThumbnailGridView: View {
     /// 是否处于向上扩展态(由 SidebarView 持有,联动压缩文件夹树)
     @Binding var expanded: Bool
 
-    private let columns = [GridItem(.adaptive(minimum: 84, maximum: 140), spacing: 8)]
+    private let columns = [GridItem(.adaptive(minimum: 72, maximum: 120), spacing: 6)]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -17,6 +17,9 @@ struct ThumbnailGridView: View {
                 Text("缩略图")
                     .font(.callout.weight(.semibold))
                 Spacer()
+                Text("\(store.images.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 Button {
                     expanded.toggle()
                 } label: {
@@ -24,22 +27,19 @@ struct ThumbnailGridView: View {
                 }
                 .buttonStyle(FlatPillButtonStyle())
                 .help(expanded ? "复原缩略图区域" : "扩大缩略图区域")
-                Spacer()
-                Text("\(store.images.count)")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
             if store.images.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "photo.stack")
-                        .font(.system(size: 24))
-                        .foregroundStyle(.secondary)
-                    Text(store.selectedFolder == nil ? "选择一个文件夹" : "此文件夹没有图片")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                // 空态:一张虚线描边的“空缩略图”占位;已选文件夹但无图时才补文字说明
+                VStack(spacing: 10) {
+                    EmptyThumbnailPlaceholder()
+                    if store.selectedFolder != nil {
+                        Text("此文件夹没有图片")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -82,6 +82,25 @@ struct ThumbnailGridView: View {
             }
         }
         .frame(maxHeight: .infinity)
+    }
+}
+
+/// 空缩略图占位:虚线圆角框 + 淡色图片图标,尺寸与缩略图格子一致
+private struct EmptyThumbnailPlaceholder: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Color.primary.opacity(0.05))
+            .overlay(
+                Image(systemName: "photo")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.tertiary)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.primary.opacity(0.14),
+                                  style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            )
+            .frame(width: 96, height: 76)
     }
 }
 

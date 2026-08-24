@@ -9,6 +9,8 @@ struct ImageViewCanvas: NSViewRepresentable {
 
     let file: ImageFile?
     let neighborURLs: [URL]
+    /// 画布背景色(来自偏好设置),切图与切换偏好时实时生效
+    let backgroundColor: NSColor
     let zoomRequest: (action: ZoomAction, token: Int)?
     let rotateRequestToken: Int
     /// 切图方向信号:+1 向后翻(新图从右滑入),-1 向前,0 无方向(淡入)
@@ -28,6 +30,7 @@ struct ImageViewCanvas: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.parent = self
         coordinator.applyFile(file)
+        coordinator.applyBackgroundColor(backgroundColor)
         if let request = zoomRequest, request.token != coordinator.appliedZoomToken {
             coordinator.appliedZoomToken = request.token
             coordinator.performZoom(request.action)
@@ -96,7 +99,7 @@ struct ImageViewCanvas: NSViewRepresentable {
             scrollView.contentInsets = NSEdgeInsets()
             scrollView.borderType = .noBorder
             scrollView.drawsBackground = true
-            scrollView.backgroundColor = NSColor(white: 0.10, alpha: 1)
+            scrollView.backgroundColor = parent.backgroundColor
             // 捏合不走系统 magnification(手势结束兑换 frame 必有一次跳变),与滚轮同一套 applyScale
             scrollView.allowsMagnification = false
             clipView.documentView = imageView
@@ -188,6 +191,12 @@ struct ImageViewCanvas: NSViewRepresentable {
                 }
             }
 #endif
+        }
+
+        /// 应用画布背景色:滚动视图与裁剪视图同步更新
+        func applyBackgroundColor(_ color: NSColor) {
+            scrollView.backgroundColor = color
+            clipView.canvasBackgroundColor = color
         }
 
         // MARK: 加载
@@ -786,6 +795,8 @@ final class CanvasClipView: NSClipView {
     var onHorizontalSwipe: ((Int) -> Void)?
     /// applyDocument 写入期间锁定 origin,防止 constrain 在同一拍改掉取景
     var pinnedOrigin: NSPoint?
+    /// 画布背景色(随偏好设置切换)
+    var canvasBackgroundColor: NSColor = NSColor(white: 0.10, alpha: 1) { didSet { needsDisplay = true } }
 
     private var swipeAccumulatedDX: CGFloat = 0
     private var swipeGestureActive = false
@@ -796,7 +807,7 @@ final class CanvasClipView: NSClipView {
     private static let swipeCommitMinInterval: TimeInterval = 0.30
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor(white: 0.10, alpha: 1).setFill()
+        canvasBackgroundColor.setFill()
         dirtyRect.fill()
     }
 
@@ -850,6 +861,19 @@ final class CanvasClipView: NSClipView {
 
     override func smartMagnify(with event: NSEvent) {
         onSmartZoom?()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        if let doc = documentView, doc.frame.contains(loc) {
+            super.mouseDown(with: event)
+            return
+        }
+        if event.clickCount == 2 {
+            window?.zoom(self)
+            return
+        }
+        window?.performDrag(with: event)
     }
 
     override func moveLeft(_ sender: Any?) { onStep?(-1) }

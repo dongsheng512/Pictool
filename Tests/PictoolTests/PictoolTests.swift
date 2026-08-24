@@ -219,6 +219,33 @@ final class ZoomMathTests: XCTestCase {
     }
 }
 
+final class PrintFitTests: XCTestCase {
+
+    func testFitScaleFillsHeightOfWiderPage() {
+        let scale = PrintPageView.fitScale(
+            imageSize: CGSize(width: 4000, height: 3000),
+            paperSize: CGSize(width: 770, height: 523)
+        )
+        XCTAssertEqual(scale, 523.0 / 3000.0, accuracy: 0.0001)
+    }
+
+    func testMatchingAspectFitScale() {
+        let scale = PrintPageView.fitScale(
+            imageSize: CGSize(width: 1600, height: 1200),
+            paperSize: CGSize(width: 800, height: 600)
+        )
+        XCTAssertEqual(scale, 0.5, accuracy: 0.0001)
+    }
+
+    func testFitScaleDoesNotExceedWhenImageIsSmaller() {
+        let scale = PrintPageView.fitScale(
+            imageSize: CGSize(width: 200, height: 100),
+            paperSize: CGSize(width: 800, height: 600)
+        )
+        XCTAssertEqual(scale, 4.0, accuracy: 0.0001)
+    }
+}
+
 final class DisplayCachePolicyTests: XCTestCase {
 
     func testCachedBrowseCoversSmallerRequest() {
