@@ -46,8 +46,8 @@ struct ThumbnailGridView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 10) {
-                            ForEach(store.images) { file in
-                                ThumbCell(file: file, isCurrent: file.id == store.selectedImageID)
+                            ForEach(Array(store.images.enumerated()), id: \.element.id) { idx, file in
+                                ThumbCell(file: file, isCurrent: file.id == store.selectedImageID, isVisible: idx < 30)
                                     .id(file.id)
                                     .onTapGesture { store.selectImage(file.id) }
                                     .contextMenu {
@@ -123,6 +123,7 @@ struct ThumbCell: View {
 
     let file: ImageFile
     let isCurrent: Bool
+    var isVisible: Bool = false
     @State private var thumb: NSImage?
 
     var body: some View {
@@ -162,7 +163,7 @@ struct ThumbCell: View {
         .contentShape(Rectangle())
         .task(id: file.id) {
             if thumb == nil {
-                thumb = await ThumbnailProvider.shared.asyncThumbnail(for: file.url, maxPixel: 180)
+                thumb = await ThumbnailProvider.shared.asyncThumbnail(for: file.url, maxPixel: 180, isVisible: isVisible)
             }
         }
     }

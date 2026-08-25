@@ -26,7 +26,7 @@ final class ThumbnailProvider: @unchecked Sendable {
         cache.object(forKey: url as NSURL)
     }
 
-    func thumbnail(for url: URL, maxPixel: CGFloat = 180, completion: @escaping @MainActor (NSImage?) -> Void) {
+    func thumbnail(for url: URL, maxPixel: CGFloat = 180, isVisible: Bool = false, completion: @escaping @MainActor (NSImage?) -> Void) {
         if let hit = cachedThumbnail(for: url) {
             Task { @MainActor in completion(hit) }
             return
@@ -40,7 +40,7 @@ final class ThumbnailProvider: @unchecked Sendable {
         lock.unlock()
         guard needsStart else { return }
 
-        queue.addOperation { [weak self] in
+        let op = BlockOperation { [weak self] in
             guard let self else { return }
             let image = Self.generate(url: url, maxPixel: maxPixel)
             if let image {
@@ -58,11 +58,14 @@ final class ThumbnailProvider: @unchecked Sendable {
             self.lock.unlock()
             for waiter in waiters { waiter(image) }
         }
+        op.queuePriority = isVisible ? .high : .normal
+        op.qualityOfService = isVisible ? .userInitiated : .utility
+        queue.addOperation(op)
     }
 
-    func asyncThumbnail(for url: URL, maxPixel: CGFloat = 180) async -> NSImage? {
+    func asyncThumbnail(for url: URL, maxPixel: CGFloat = 180, isVisible: Bool = false) async -> NSImage? {
         await withCheckedContinuation { cont in
-            thumbnail(for: url, maxPixel: maxPixel) { cont.resume(returning: $0) }
+            thumbnail(for: url, maxPixel: maxPixel, isVisible: isVisible) { cont.resume(returning: $0) }
         }
     }
 
