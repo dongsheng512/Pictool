@@ -17,9 +17,6 @@ struct ThumbnailGridView: View {
                 Text("缩略图")
                     .font(.callout.weight(.semibold))
                 Spacer()
-                Text("\(store.images.count)")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
                 Button {
                     expanded.toggle()
                 } label: {
@@ -27,6 +24,10 @@ struct ThumbnailGridView: View {
                 }
                 .buttonStyle(FlatPillButtonStyle())
                 .help(expanded ? "复原缩略图区域" : "扩大缩略图区域")
+                Spacer()
+                Text("\(store.images.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
