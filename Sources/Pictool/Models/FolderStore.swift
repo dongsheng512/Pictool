@@ -51,6 +51,16 @@ final class FolderStore {
     var sidebarVisible = true
     private var sidebarBeforeImmersive = true
 
+    /// 单张/少量打开模式：默认不加载同目录所有图片，侧边提示按需加载
+    private(set) var isSingleImageMode = false
+    private(set) var singleImageSourceFolder: URL?
+    var pendingOtherCount: Int {
+        guard isSingleImageMode, let folder = singleImageSourceFolder else { return 0 }
+        let all = ImageDiscovery.images(in: folder).count
+        let hidden = hiddenByFolder[standardized(folder)]?.count ?? 0
+        return max(0, all - hidden - images.count)
+    }
+
     func toggleImmersive() {
         if !isImmersive, currentImage == nil { return }
         isImmersive.toggle()
@@ -137,20 +147,87 @@ final class FolderStore {
     }
 
     func openFolder(_ url: URL) {
+        isSingleImageMode = false
+        singleImageSourceFolder = nil
         selectFolder(ensureRoot(url))
     }
 
-    /// 打开外部图片文件:定位其所在文件夹并选中该图。
-    /// 注意:selectFolder 会同步重算 images,所以必须先选文件夹再查/选中目标图。
+    /// 打开外部图片文件（单张/少量）：默认仅加载所选图，侧边提示按需加载同目录其余图片
     func revealExternalImage(_ url: URL) {
-        openFolder(url.deletingLastPathComponent())
-        if images.contains(where: { $0.id == url }) {
-            selectImage(url)
+        revealExternalImages([url])
+    }
+
+    func revealExternalImages(_ urls: [URL]) {
+        let imageURLs = urls.filter { ImageDiscovery.isImageFile($0) }
+            .map { $0.standardizedFileURL }
+            .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
+        guard !imageURLs.isEmpty else { return }
+        // 统一用 standardized，便于去重与比较
+        let unique = Array(Set(imageURLs)).sorted { ImageDiscovery.naturalLess($0.lastPathComponent, $1.lastPathComponent) }
+        // 是否同目录
+        let firstFolder = unique[0].deletingLastPathComponent().standardizedFileURL
+        let sameFolder = unique.allSatisfy { $0.deletingLastPathComponent().standardizedFileURL == firstFolder }
+        if sameFolder {
+            let allImages = ImageDiscovery.images(in: firstFolder)
+            let hidden = hiddenByFolder[standardized(firstFolder)] ?? []
+            let filteredAll = allImages.filter { !hidden.contains(standardized($0.url)) }
+            // 若同目录总数 > 本次选择数，则进入单图模式（仅展示所选，其余按需）
+            if filteredAll.count > unique.count {
+                let node = ensureRoot(firstFolder)
+                selectedFolderID = node.id
+                isSingleImageMode = true
+                singleImageSourceFolder = firstFolder
+                ThumbnailProvider.shared.cancelAll()
+                DisplayImageCache.shared.cancelAll()
+                images = unique.map { ImageFile(id: $0) }
+                selectedImageID = images.first?.id
+                if let sel = selectedImageID { selectionMemory[standardized(firstFolder)] = sel }
+                prefetchNeighbors()
+                return
+            }
+        }
+        // 非同目录多选：作为临时虚拟相册（不关联文件夹，仅展示所选）
+        if unique.count > 1 && !sameFolder {
+            // 仍需一个根用于侧栏展示，选首图所在目录为关联目录但不自动加载
+            let node = ensureRoot(firstFolder)
+            selectedFolderID = node.id
+            isSingleImageMode = true
+            singleImageSourceFolder = nil
+            ThumbnailProvider.shared.cancelAll()
+            DisplayImageCache.shared.cancelAll()
+            images = unique.map { ImageFile(id: $0) }
+            selectedImageID = images.first?.id
+            prefetchNeighbors()
+            return
+        }
+        // 回退：同目录且已全选 / 单张且目录仅一张 → 直接走文件夹全量
+        isSingleImageMode = false
+        singleImageSourceFolder = nil
+        openFolder(firstFolder)
+        if let first = unique.first, images.contains(where: { $0.id == first }) {
+            selectImage(first)
+        }
+    }
+
+    /// 单图模式下，按需加载同目录所有图片
+    func loadAllFromCurrentFolder() {
+        guard isSingleImageMode, let folder = singleImageSourceFolder else { return }
+        let current = selectedImageID
+        isSingleImageMode = false
+        singleImageSourceFolder = nil
+        let node = ensureRoot(folder)
+        // selectFolder 会重算 images 并 cancel 队列
+        selectFolder(node)
+        if let cur = current, images.contains(where: { $0.id == cur }) {
+            selectImage(cur)
         }
     }
 
     func selectFolder(_ node: FolderNode) {
         selectedFolderID = node.id
+        // 显式选文件夹即退出单图模式
+        isSingleImageMode = false
+        singleImageSourceFolder = nil
         let key = standardized(node.url)
         let hidden = hiddenByFolder[key] ?? []
         // 取消旧缩略图队列，避免 1000 张切盘时积压

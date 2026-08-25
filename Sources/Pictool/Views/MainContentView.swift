@@ -431,19 +431,50 @@ struct MainContentView: View {
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
             store.openFolder(url)
         } else if ImageDiscovery.isImageFile(url) {
-            store.revealExternalImage(url)
+            store.revealExternalImages([url])
         }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        _ = provider.loadObject(ofClass: URL.self) { url, _ in
-            guard let url else { return }
-            Task { @MainActor in
-                handleExternal(url)
+        guard !providers.isEmpty else { return false }
+        var pending = providers.count
+        var urls: [URL] = []
+        let lock = NSLock()
+        for provider in providers {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                var shouldHandle = false
+                lock.lock()
+                if let url { urls.append(url) }
+                pending -= 1
+                shouldHandle = pending == 0
+                lock.unlock()
+                if shouldHandle {
+                    Task { @MainActor in
+                        self.handleDroppedURLs(urls)
+                    }
+                }
             }
         }
         return true
+    }
+
+    @MainActor
+    private func handleDroppedURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        // 目录拖入：直接打开首个目录（保持原有行为）
+        let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        if dirs.count == 1 && urls.count == 1 {
+            store.openFolder(dirs[0])
+            return
+        }
+        // 其余按图片处理（单张/多张同目录走单图模式，自动提示按需加载）
+        let imageURLs = urls.filter { ImageDiscovery.isImageFile($0) }
+        if !imageURLs.isEmpty {
+            store.revealExternalImages(imageURLs)
+            return
+        }
+        // 兜底：若拖入的是目录集合，打开首个
+        if let firstDir = dirs.first { store.openFolder(firstDir) }
     }
 }
 

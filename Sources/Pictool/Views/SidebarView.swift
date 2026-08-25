@@ -12,6 +12,9 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             folderTree
+            if store.isSingleImageMode, store.pendingOtherCount > 0 {
+                singleImagePrompt
+            }
             if !store.roots.isEmpty {
                 ThumbnailGridView(expanded: $thumbnailsExpanded)
             }
@@ -64,6 +67,39 @@ struct SidebarView: View {
                 store.selectFolder(node)
             }
         )
+    }
+
+    private var singleImagePrompt: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 11))
+                Text("同目录还有 \(store.pendingOtherCount) 张")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            Button {
+                store.loadAllFromCurrentFolder()
+            } label: {
+                Text("加载同目录所有图片")
+                    .font(.caption.weight(.medium))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(Color.accentColor)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.06))
+        )
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 }
 
