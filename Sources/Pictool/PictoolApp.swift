@@ -1,21 +1,78 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+extension Notification.Name {
+    static let openExternalURLs = Notification.Name("openExternalURLs")
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var store: FolderStore?
+
+    func application(_ application: NSApplication, openFile filename: String) -> Bool {
+        let url = URL(fileURLWithPath: filename)
+        handle(urls: [url])
+        return true
+    }
+
+    func application(_ application: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        handle(urls: urls)
+        application.reply(toOpenOrPrint: .success)
+    }
+
+    private func handle(urls: [URL]) {
+        guard let store = store else {
+            // 尚未初始化时先发通知，MainContentView 会在 onReceive 中处理
+            NotificationCenter.default.post(name: .openExternalURLs, object: urls)
+            return
+        }
+        Task { @MainActor in
+            let imageURLs = urls.filter { ImageDiscovery.isImageFile($0) }
+            let dirURLs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            if !imageURLs.isEmpty {
+                store.revealExternalImages(imageURLs)
+            } else if let dir = dirURLs.first {
+                store.openFolder(dir)
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            if let w = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.identifier?.rawValue == "main" }) {
+                w.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+}
 
 @main
 struct PictoolApp: App {
 
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @State private var store = FolderStore()
 
     var body: some Scene {
-        WindowGroup {
+        Window("PureView", id: "main") {
             MainContentView()
                 .environment(store)
                 .ignoresSafeArea(.container, edges: .top)
+                .onAppear { delegate.store = store }
+                .onReceive(NotificationCenter.default.publisher(for: .openExternalURLs)) { note in
+                    if let urls = note.object as? [URL] {
+                        if urls.count == 1, let url = urls.first {
+                            var isDir: ObjCBool = false
+                            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                                store.openFolder(url)
+                            } else {
+                                store.revealExternalImages(urls)
+                            }
+                        } else {
+                            store.revealExternalImages(urls)
+                        }
+                    }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1024, height: 680)
-        Settings {
-            SettingsView()
-        }
+        .handlesExternalEvents(matching: Set(arrayLiteral: "*"))
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("打开文件夹…") { store.openFolderPanel() }
@@ -61,6 +118,9 @@ struct PictoolApp: App {
                     .keyboardShortcut("r", modifiers: [.command, .option])
                     .disabled(store.currentImage == nil)
             }
+        }
+        Settings {
+            SettingsView()
         }
     }
 }
