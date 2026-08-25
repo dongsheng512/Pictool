@@ -53,7 +53,7 @@ struct CropView: View {
             Spacer()
 
             if pixelSize.width > 0 {
-                Text("\(pixelRect.width) × \(pixelRect.height) px")
+                Text("\(Int(pixelRect.width.rounded())) × \(Int(pixelRect.height.rounded())) px")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
