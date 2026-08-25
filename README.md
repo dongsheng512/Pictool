@@ -1,4 +1,4 @@
-# Pictool · PureView v0.10
+# PureView v0.10
 
 macOS 原生图片查看器 · Swift 6 + SwiftUI(混合 AppKit) · 零第三方依赖 · 支持 61 种格式
 
