@@ -12,6 +12,7 @@ xcuserdata/
 
 # Agent tooling artifacts
 .mimosa/
+.workbuddy/
 
 # Editor
 .vscode/

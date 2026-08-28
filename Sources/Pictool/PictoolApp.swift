@@ -21,6 +21,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         application.reply(toOpenOrPrint: .success)
     }
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
     private func handle(urls: [URL]) {
         guard let store = store else {
             // 尚未初始化时先发通知，MainContentView 会在 onReceive 中处理
@@ -89,10 +93,10 @@ struct PictoolApp: App {
             CommandMenu("图片") {
                 Button("上一张") { store.step(-1) }
                     .keyboardShortcut(.leftArrow, modifiers: [])
-                    .disabled(store.images.isEmpty)
+                    .disabled(!store.canStep(-1))
                 Button("下一张") { store.step(1) }
                     .keyboardShortcut(.rightArrow, modifiers: [])
-                    .disabled(store.images.isEmpty)
+                    .disabled(!store.canStep(1))
                 Divider()
                 Button("适配窗口") { store.requestZoom(.fit) }
                     .keyboardShortcut("0", modifiers: [])

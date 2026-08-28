@@ -96,6 +96,88 @@ final class ImageDiscoveryTests: XCTestCase {
         let sorted = ImageDiscovery.sortedByName(names.map { URL(fileURLWithPath: "/tmp/\($0)") })
         XCTAssertEqual(sorted.map { $0.lastPathComponent }, ["a2.png", "a10.png", "b1.png", "b2.png"])
     }
+
+    func testSortedByNameDescending() {
+        let urls = ["img1.jpg", "img2.jpg", "img10.jpg"].map { URL(fileURLWithPath: "/tmp/\($0)") }
+        let sorted = ImageDiscovery.sorted(urls, by: ImageSortPreference(key: .name, direction: .descending))
+        XCTAssertEqual(sorted.map(\.lastPathComponent), ["img10.jpg", "img2.jpg", "img1.jpg"])
+    }
+
+    func testCompareBySizeAndNameTiebreak() {
+        let a = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/b.jpg"),
+            modified: Date(timeIntervalSince1970: 10),
+            size: 100,
+            captured: nil
+        )
+        let b = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/a.jpg"),
+            modified: Date(timeIntervalSince1970: 20),
+            size: 100,
+            captured: nil
+        )
+        let pref = ImageSortPreference(key: .size, direction: .ascending)
+        // 大小相同,回退文件名 a < b
+        XCTAssertTrue(ImageDiscovery.compare(b, a, by: pref))
+        XCTAssertFalse(ImageDiscovery.compare(a, b, by: pref))
+    }
+
+    func testCompareByModifiedDescending() {
+        let older = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/old.jpg"),
+            modified: Date(timeIntervalSince1970: 1),
+            size: 1,
+            captured: nil
+        )
+        let newer = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/new.jpg"),
+            modified: Date(timeIntervalSince1970: 9),
+            size: 1,
+            captured: nil
+        )
+        let pref = ImageSortPreference(key: .modified, direction: .descending)
+        XCTAssertTrue(ImageDiscovery.compare(newer, older, by: pref))
+    }
+
+    func testCompareCapturedFallsBackToModified() {
+        let withExif = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/cam.jpg"),
+            modified: Date(timeIntervalSince1970: 100),
+            size: 1,
+            captured: Date(timeIntervalSince1970: 1)
+        )
+        let noExif = ImageDiscovery.SortRecord(
+            url: URL(fileURLWithPath: "/tmp/scan.jpg"),
+            modified: Date(timeIntervalSince1970: 50),
+            size: 1,
+            captured: nil
+        )
+        let pref = ImageSortPreference(key: .captured, direction: .ascending)
+        XCTAssertTrue(ImageDiscovery.compare(withExif, noExif, by: pref))
+    }
+}
+
+final class ImageNavigationTests: XCTestCase {
+
+    func testWrapForwardFromLast() {
+        XCTAssertEqual(ImageNavigation.nextIndex(current: 2, count: 3, delta: 1, wrap: true), 0)
+    }
+
+    func testWrapBackwardFromFirst() {
+        XCTAssertEqual(ImageNavigation.nextIndex(current: 0, count: 3, delta: -1, wrap: true), 2)
+    }
+
+    func testNoWrapStopsAtEnds() {
+        XCTAssertNil(ImageNavigation.nextIndex(current: 0, count: 3, delta: -1, wrap: false))
+        XCTAssertNil(ImageNavigation.nextIndex(current: 2, count: 3, delta: 1, wrap: false))
+        XCTAssertEqual(ImageNavigation.nextIndex(current: 1, count: 3, delta: 1, wrap: false), 2)
+    }
+
+    func testEmptyAndSingle() {
+        XCTAssertNil(ImageNavigation.nextIndex(current: 0, count: 0, delta: 1, wrap: true))
+        XCTAssertEqual(ImageNavigation.nextIndex(current: 0, count: 1, delta: 1, wrap: true), 0)
+        XCTAssertNil(ImageNavigation.nextIndex(current: 0, count: 1, delta: 1, wrap: false))
+    }
 }
 
 final class MetadataFormatTests: XCTestCase {
@@ -111,6 +193,31 @@ final class MetadataFormatTests: XCTestCase {
     func testColorModelNames() {
         XCTAssertEqual(MetadataService.colorModelName("RGB"), "RGB")
         XCTAssertEqual(MetadataService.colorModelName("Gray"), "灰度")
+    }
+
+    func testParseEXIFDateStandard() {
+        let date = MetadataService.parseEXIFDate("2024:08:15 13:45:01")
+        XCTAssertNotNil(date)
+        let comps = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second], from: date!
+        )
+        XCTAssertEqual(comps.year, 2024)
+        XCTAssertEqual(comps.month, 8)
+        XCTAssertEqual(comps.day, 15)
+        XCTAssertEqual(comps.hour, 13)
+        XCTAssertEqual(comps.minute, 45)
+        XCTAssertEqual(comps.second, 1)
+    }
+
+    func testParseEXIFDateAcceptsDashAndT() {
+        XCTAssertNotNil(MetadataService.parseEXIFDate("2024-08-15T13:45:01"))
+        XCTAssertNotNil(MetadataService.parseEXIFDate("2024-08-15 13:45:01.123"))
+    }
+
+    func testParseEXIFDateRejectsGarbage() {
+        XCTAssertNil(MetadataService.parseEXIFDate(""))
+        XCTAssertNil(MetadataService.parseEXIFDate("not-a-date"))
+        XCTAssertNil(MetadataService.parseEXIFDate("2024:08"))
     }
 }
 

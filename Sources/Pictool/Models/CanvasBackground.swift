@@ -7,11 +7,19 @@ enum CanvasBackground: String, CaseIterable, Identifiable {
     case light
 
     static let storageKey = "canvasBackground"
-    static let defaultValue = CanvasBackground.dark
+    static let defaultValue = CanvasBackground.light
+
+    var isDark: Bool { self == .dark }
+
+    /// 旧版「棋盘格」收成白色
+    static func normalizeStoredValue() {
+        if UserDefaults.standard.string(forKey: storageKey) == "checkerboard" {
+            UserDefaults.standard.set(CanvasBackground.light.rawValue, forKey: storageKey)
+        }
+    }
 
     var id: String { rawValue }
 
-    /// 深色沿用原画布底色(white 0.10),浅色为纯白
     var color: NSColor {
         switch self {
         case .dark: NSColor(white: 0.10, alpha: 1)
@@ -25,5 +33,10 @@ enum CanvasBackground: String, CaseIterable, Identifiable {
         case .dark: "黑色"
         case .light: "白色"
         }
+    }
+
+    func fill(_ dirtyRect: NSRect) {
+        color.setFill()
+        dirtyRect.fill()
     }
 }

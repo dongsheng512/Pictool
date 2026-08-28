@@ -5,6 +5,7 @@ import AppKit
 struct SidebarView: View {
 
     @Environment(FolderStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
     @State private var expandedIDs: Set<FolderNode.ID> = []
     /// 缩略图区是否向上扩展(压缩文件夹树高度);再点一次复原
     @State private var thumbnailsExpanded = false
@@ -22,12 +23,11 @@ struct SidebarView: View {
         .animation(.easeInOut(duration: 0.22), value: thumbnailsExpanded)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
-        ZStack {
-            SidebarMaterial()
-            // 柔化磨砂：轻微提亮，让侧栏在浅色模式下更通透、不发灰
-            Color.white.opacity(0.30)
+            ZStack {
+                SidebarMaterial()
+                ChromeTheme.sidebarWash(for: colorScheme)
+            }
         }
-    }
     }
 
     private var folderTree: some View {
@@ -103,11 +103,6 @@ struct SidebarView: View {
     }
 }
 
-struct SidebarWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 200
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
 /// Finder 同款侧栏材质(顶栏左侧与侧栏共用)
 struct SidebarMaterial: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
@@ -121,16 +116,42 @@ struct SidebarMaterial: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
-/// 顶栏右侧（主区）的磨砂材质，与主区柔和白底呼应
-struct HeaderMaterial: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .headerView
-        view.blendingMode = .withinWindow
-        view.state = .followsWindowActiveState
-        return view
+enum ChromeTheme {
+    /// 主区背景(欢迎页 / 画布浅色 #FAFAFB)
+    static let mainAreaFill = Color(red: 0.980, green: 0.980, blue: 0.984)
+
+    static func sidebarWash(for scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color.clear : Color.white.opacity(0.10)
     }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+
+    static func fill(_ canvas: CanvasBackground) -> Color {
+        canvas.isDark ? Color(white: 0.10) : mainAreaFill
+    }
+
+    static func colorScheme(for canvas: CanvasBackground) -> ColorScheme {
+        canvas.isDark ? .dark : .light
+    }
+}
+
+/// 主区顶栏/底栏/欢迎页,跟画布纯色
+struct MainChromeBackground: View {
+    var canvas: CanvasBackground
+
+    var body: some View {
+        ChromeTheme.fill(canvas)
+    }
+}
+
+/// 侧栏顶段(红绿灯列):与侧栏同材质,不跟主区顶栏
+struct SidebarTopBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            SidebarMaterial()
+            ChromeTheme.sidebarWash(for: colorScheme)
+        }
+    }
 }
 
 struct FolderTreeRow: View {

@@ -9,8 +9,10 @@ struct ImageViewCanvas: NSViewRepresentable {
 
     let file: ImageFile?
     let neighborURLs: [URL]
-    /// 画布背景色(来自偏好设置),切图与切换偏好时实时生效
-    let backgroundColor: NSColor
+    /// 画布背景(来自偏好设置),切图与切换偏好时实时生效
+    let background: CanvasBackground
+    /// 打开新图时的默认缩放
+    let openZoomMode: OpenZoomMode
     let zoomRequest: (action: ZoomAction, token: Int)?
     let rotateRequestToken: Int
     /// 切图方向信号:+1 向后翻(新图从右滑入),-1 向前,0 无方向(淡入)
@@ -30,7 +32,7 @@ struct ImageViewCanvas: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.parent = self
         coordinator.applyFile(file)
-        coordinator.applyBackgroundColor(backgroundColor)
+        coordinator.applyBackground(background)
         if let request = zoomRequest, request.token != coordinator.appliedZoomToken {
             coordinator.appliedZoomToken = request.token
             coordinator.performZoom(request.action)
@@ -106,9 +108,11 @@ struct ImageViewCanvas: NSViewRepresentable {
             scrollView.contentInsets = NSEdgeInsets()
             scrollView.borderType = .noBorder
             scrollView.drawsBackground = true
-            scrollView.backgroundColor = parent.backgroundColor
+            scrollView.backgroundColor = parent.background.color
             // 捏合不走系统 magnification(手势结束兑换 frame 必有一次跳变),与滚轮同一套 applyScale
             scrollView.allowsMagnification = false
+            clipView.drawsBackground = false
+            clipView.canvasBackground = parent.background
             clipView.documentView = imageView
             scrollView.contentView = clipView
 
@@ -200,10 +204,14 @@ struct ImageViewCanvas: NSViewRepresentable {
 #endif
         }
 
-        /// 应用画布背景色:滚动视图与裁剪视图同步更新
-        func applyBackgroundColor(_ color: NSColor) {
-            scrollView.backgroundColor = color
-            clipView.canvasBackgroundColor = color
+        /// 应用画布背景;图片层保持透明以便 PNG 透出背景
+        func applyBackground(_ background: CanvasBackground) {
+            scrollView.drawsBackground = true
+            scrollView.backgroundColor = background.color
+            clipView.drawsBackground = false
+            clipView.canvasBackground = background
+            imageView.layer?.isOpaque = false
+            imageView.layer?.backgroundColor = NSColor.clear.cgColor
         }
 
         // MARK: 加载
@@ -320,7 +328,7 @@ struct ImageViewCanvas: NSViewRepresentable {
                 formatName: MetadataService.formatName(of: facts.formatID)
             ))
             imageView.image = image
-            applyFit()
+            applyOpenZoom()
             if facts.frameCount > 1 {
                 startAnimation(url: url)
             }
@@ -415,6 +423,27 @@ struct ImageViewCanvas: NSViewRepresentable {
             wasFit = true
             updateFrameCentered()
             notifyScale()
+        }
+
+        /// 切图时按偏好套用默认缩放(瞬时,不走平滑动画)
+        private func applyOpenZoom() {
+            switch parent.openZoomMode {
+            case .fit:
+                applyFit()
+            case .actualSize:
+                applyActualSizeImmediate()
+            }
+        }
+
+        private func applyActualSizeImmediate() {
+            if abs(scrollView.magnification - 1) > 0.0005 { scrollView.magnification = 1 }
+            fitScale = fitScaleValue()
+            let backing = scrollView.window?.backingScaleFactor ?? 2
+            scale = 1 / backing
+            wasFit = false
+            updateFrameCentered()
+            notifyScale()
+            scheduleEscalateCheck()
         }
 
         private func updateFrameCentered() {
@@ -802,8 +831,8 @@ final class CanvasClipView: NSClipView {
     var onHorizontalSwipe: ((Int) -> Void)?
     /// applyDocument 写入期间锁定 origin,防止 constrain 在同一拍改掉取景
     var pinnedOrigin: NSPoint?
-    /// 画布背景色(随偏好设置切换)
-    var canvasBackgroundColor: NSColor = NSColor(white: 0.10, alpha: 1) { didSet { needsDisplay = true } }
+    /// 画布背景(随偏好设置切换)
+    var canvasBackground: CanvasBackground = .dark { didSet { needsDisplay = true } }
 
     private var swipeAccumulatedDX: CGFloat = 0
     private var swipeGestureActive = false
@@ -813,9 +842,10 @@ final class CanvasClipView: NSClipView {
     private static let horizontalSwipeThreshold: CGFloat = 55
     private static let swipeCommitMinInterval: TimeInterval = 0.30
 
+    override var isOpaque: Bool { true }
+
     override func draw(_ dirtyRect: NSRect) {
-        canvasBackgroundColor.setFill()
-        dirtyRect.fill()
+        canvasBackground.fill(dirtyRect)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -966,6 +996,8 @@ final class CanvasImageView: NSImageView {
             "transform": NSNull(),
         ]
         layer = hostLayer
+        hostLayer.isOpaque = false
+        hostLayer.backgroundColor = NSColor.clear.cgColor
     }
 
     override func viewDidMoveToWindow() {

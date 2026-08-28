@@ -13,7 +13,15 @@ struct MainContentView: View {
     @State private var sidebarWidth: CGFloat = UserDefaults.standard.double(forKey: "sidebarWidth") > 0 ? UserDefaults.standard.double(forKey: "sidebarWidth") : 260
     @State private var dragStartWidth: CGFloat = 260
     @State private var isHoveringDivider = false
-    @AppStorage(CanvasBackground.storageKey) private var canvasBackgroundRaw = CanvasBackground.defaultValue.rawValue
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
+    @AppStorage(OpenZoomMode.storageKey) private var openZoomMode = OpenZoomMode.defaultValue
+    @AppStorage(WrapNavigation.storageKey) private var wrapNavigation = WrapNavigation.defaultValue
+    @AppStorage(ImageSortKey.storageKey) private var sortKey = ImageSortKey.defaultValue
+    @AppStorage(ImageSortDirection.storageKey) private var sortDirection = ImageSortDirection.defaultValue
+
+    private var sortPreference: ImageSortPreference {
+        ImageSortPreference(key: sortKey, direction: sortDirection)
+    }
 
     var body: some View {
         @Bindable var store = store
@@ -27,8 +35,20 @@ struct MainContentView: View {
         .frame(minWidth: 960, minHeight: 600)
         .background(WindowChrome(immersive: store.isImmersive))
         .onAppear {
+            CanvasBackground.normalizeStoredValue()
             runZoomSelfTestIfRequested()
             dragStartWidth = sidebarWidth
+            store.wrapNavigation = wrapNavigation
+            store.applySortPreference(sortPreference)
+        }
+        .onChange(of: wrapNavigation) { _, value in
+            store.wrapNavigation = value
+        }
+        .onChange(of: sortKey) { _, _ in
+            store.applySortPreference(sortPreference)
+        }
+        .onChange(of: sortDirection) { _, _ in
+            store.applySortPreference(sortPreference)
         }
         .onOpenURL { url in handleExternal(url) }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -64,8 +84,8 @@ struct MainContentView: View {
             ImageViewCanvas(
                 file: store.currentImage,
                 neighborURLs: store.neighborURLs,
-                backgroundColor: CanvasBackground(rawValue: canvasBackgroundRaw)?.color
-                    ?? CanvasBackground.defaultValue.color,
+                background: canvasBackground,
+                openZoomMode: openZoomMode,
                 zoomRequest: store.zoomRequest,
                 rotateRequestToken: store.rotateRequestToken,
                 stepDirection: store.lastStepDirection,
@@ -132,10 +152,7 @@ struct MainContentView: View {
                     }
             }
             .padding(.top, 32)
-            PureHeader(
-                sidebarWidth: store.sidebarVisible ? sidebarWidth : nil,
-                sidebarVisible: store.sidebarVisible
-            )
+            PureHeader(sidebarWidth: store.sidebarVisible ? sidebarWidth : nil)
                 .frame(maxWidth: .infinity, alignment: .top)
         }
         .ignoresSafeArea(edges: .top)
@@ -169,8 +186,8 @@ struct MainContentView: View {
                 ImageViewCanvas(
                     file: store.currentImage,
                     neighborURLs: store.neighborURLs,
-                    backgroundColor: CanvasBackground(rawValue: canvasBackgroundRaw)?.color
-                        ?? CanvasBackground.defaultValue.color,
+                    background: canvasBackground,
+                    openZoomMode: openZoomMode,
                     zoomRequest: store.zoomRequest,
                     rotateRequestToken: store.rotateRequestToken,
                     stepDirection: store.lastStepDirection,
@@ -233,7 +250,8 @@ struct MainContentView: View {
                 .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(SoftWhiteOverlay())
+        .environment(\.colorScheme, ChromeTheme.colorScheme(for: canvasBackground))
+        .background(MainChromeBackground(canvas: canvasBackground))
     }
 
     /// 缩放下拉的菜单项(悬停高亮)
@@ -262,29 +280,6 @@ struct MainContentView: View {
                 in: RoundedRectangle(cornerRadius: 4)
             )
             .onHover { hovering = $0 }
-        }
-    }
-
-    /// 柔和磨砂白底，与侧栏/header 形成同色系过渡，避免纯白刺眼
-    private struct FrostedWhiteBackground: NSViewRepresentable {
-        func makeNSView(context: Context) -> NSVisualEffectView {
-            let view = NSVisualEffectView()
-            view.material = .headerView
-            view.blendingMode = .withinWindow
-            view.state = .followsWindowActiveState
-            return view
-        }
-
-        func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-    }
-
-    private struct SoftWhiteOverlay: View {
-        var body: some View {
-            ZStack {
-                FrostedWhiteBackground()
-                // 柔和米白提亮，#FAFAFB @ 0.72
-                Color(red: 0.985, green: 0.985, blue: 0.987).opacity(0.22)
-            }
         }
     }
 
@@ -332,11 +327,9 @@ struct MainContentView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .environment(\.colorScheme, ChromeTheme.colorScheme(for: canvasBackground))
         .background {
-            ZStack {
-                HeaderMaterial()
-                Color.white.opacity(0.22)
-            }
+            MainChromeBackground(canvas: canvasBackground)
         }
     }
 
@@ -512,15 +505,15 @@ private final class ChromeView: NSView {
         window.contentView?.superview?.wantsLayer = true
         window.contentView?.superview?.layer?.cornerRadius = radius
         window.contentView?.superview?.layer?.masksToBounds = true
-        // 隐藏原生红绿灯（PureHeader 已自绘）；纯净模式直接隐藏整个原生标题栏，不留透明条
+        // 原生标题栏藏掉,避免挡自定义顶栏点击;红绿灯由 PureHeader 里的 NativeTrafficLights 接管。
+        // 纯净模式连按钮一起藏。
         for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(b)?.isHidden = true
+            window.standardWindowButton(b)?.isHidden = immersive
         }
-        window.standardWindowButton(.closeButton)?.superview?.isHidden = true
         if let theme = window.contentView?.superview {
             for sub in theme.subviews where String(describing: type(of: sub)).contains("Titlebar") {
-                sub.isHidden = immersive
-                sub.frame.size.height = immersive ? 0 : 28
+                sub.isHidden = true
+                sub.frame.size.height = 0
             }
         }
     }

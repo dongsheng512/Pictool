@@ -6,90 +6,50 @@ import AppKit
 struct PureHeader: View {
 
     @Environment(FolderStore.self) private var store
-    /// 侧栏可见时的宽度，用于让顶栏左段与侧栏材质无缝衔接（原生 Finder 效果）
+    @Environment(\.colorScheme) private var systemColorScheme
+    /// 侧栏可见时的宽度,用来把顶栏左段切成独立的「侧栏顶」
     var sidebarWidth: CGFloat? = nil
-    var sidebarVisible: Bool = false
+    @AppStorage(SidebarTopStyle.storageKey) private var sidebarTopStyle = SidebarTopStyle.defaultValue
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
+
+    private var splitsSidebarTop: Bool {
+        sidebarWidth != nil && sidebarTopStyle == .followSidebar
+    }
+
+    private var mainHeaderColorScheme: ColorScheme {
+        ChromeTheme.colorScheme(for: canvasBackground)
+    }
 
     var body: some View {
-        HStack(spacing: 5) {
-            WindowControls()
-            HeaderButton("sidebar.leading", help: "显示/隐藏侧栏 (⌃⌘S)") {
-                store.toggleSidebar()
+        Group {
+            if splitsSidebarTop, let width = sidebarWidth {
+                HStack(spacing: 0) {
+                    leftCluster
+                        .padding(.leading, 12)
+                        .frame(width: width, alignment: .leading)
+                        .clipped()
+                        .environment(\.colorScheme, systemColorScheme)
+                    rightCluster
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .environment(\.colorScheme, mainHeaderColorScheme)
+                }
+            } else {
+                HStack(spacing: 5) {
+                    leftCluster
+                    Spacer()
+                    rightCluster
+                }
+                .padding(.horizontal, 12)
+                .environment(\.colorScheme, mainHeaderColorScheme)
             }
-
-            Spacer().frame(width: 8)
-            Text("PureView")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
-
-            Spacer()
-
-            HeaderButton("folder.badge.plus", help: "打开图片文件夹 (⌘O)") {
-                store.openFolderPanel()
-            }
-
-            HeaderDivider()
-
-            HeaderButton("chevron.left", help: "上一张 (←)",
-                         disabled: store.images.isEmpty) { store.step(-1) }
-            HeaderButton("chevron.right", help: "下一张 (→)",
-                         disabled: store.images.isEmpty) { store.step(1) }
-
-            HeaderDivider()
-
-            HeaderButton("minus.magnifyingglass", help: "缩小 (⌘-)",
-                         disabled: store.currentImage == nil) { store.requestZoom(.zoomOut) }
-            HeaderButton("plus.magnifyingglass", help: "放大 (⌘=)",
-                         disabled: store.currentImage == nil) { store.requestZoom(.zoomIn) }
-
-            HeaderDivider()
-
-            HeaderButton("rotate.right", help: "顺时针旋转 90°",
-                         disabled: store.currentImage == nil) { store.requestRotate() }
-            HeaderButton("crop", help: "裁切 (C)",
-                         disabled: store.currentImage == nil) { store.requestCrop() }
-            HeaderButton("printer", help: "打印 (⌘P)",
-                         disabled: store.currentImage == nil) { store.requestPrint() }
-            HeaderButton("info.circle", help: "图片信息 (I)") {
-                store.showInspector.toggle()
-            }
-
-            HeaderDivider()
-
-            HeaderButton(
-                store.isImmersive ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                help: store.isImmersive ? "退出只看图 (Esc / F)" : "只看图,隐藏所有界面 (F)",
-                disabled: store.currentImage == nil && !store.isImmersive
-            ) { store.toggleImmersive() }
         }
-        .padding(.horizontal, 12)
         .frame(height: 32)
         .frame(maxWidth: .infinity)
-        // 可定制：背景材质、圆角、阴影都在此改
         .background {
-            // 分段磨砂：左侧与侧栏同色，右侧与主区同色；两段直接相邻无间隙、无渐变块，靠色差本身区分
-            // 已把两侧白度拉近（左 0.30 / 右 0.16）让竖向硬线对比从 17 降至 ~6，肉眼几乎看不见
-            Group {
-                if sidebarVisible, let w = sidebarWidth {
-                    HStack(spacing: 0) {
-                        ZStack {
-                            SidebarMaterial()
-                            Color.white.opacity(0.30)
-                        }
-                        .frame(width: w)
-                        ZStack {
-                            HeaderMaterial()
-                            Color.white.opacity(0.16)
-                        }
-                    }
-                } else {
-                    ZStack {
-                        HeaderMaterial()
-                        Color.white.opacity(0.16)
-                    }
-                }
-            }
-        }        .background {
+            headerBackground
+        }
+        .background {
             // 自定义拖拽区：空白处拖动窗口，双击缩放；按钮区域不受影响
             Color.clear
                 .contentShape(Rectangle())
@@ -105,6 +65,72 @@ struct PureHeader: View {
                 .onTapGesture(count: 2) { NSApp.keyWindow?.zoom(nil) }
         }
 
+    }
+
+    @ViewBuilder
+    private var headerBackground: some View {
+        if splitsSidebarTop, let width = sidebarWidth {
+            HStack(spacing: 0) {
+                SidebarTopBackground()
+                    .frame(width: width)
+                mainHeaderBackground
+            }
+        } else {
+            mainHeaderBackground
+        }
+    }
+
+    private var mainHeaderBackground: some View {
+        MainChromeBackground(canvas: canvasBackground)
+    }
+
+    private var leftCluster: some View {
+        HStack(spacing: 5) {
+            NativeTrafficLights()
+                .frame(width: NativeTrafficLights.width, height: NativeTrafficLights.height)
+            HeaderButton("sidebar.leading", help: "显示/隐藏侧栏 (⌃⌘S)") {
+                store.toggleSidebar()
+            }
+            Spacer().frame(width: 8)
+            Text("PureView")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+    }
+
+    private var rightCluster: some View {
+        HStack(spacing: 5) {
+            HeaderButton("folder.badge.plus", help: "打开图片文件夹 (⌘O)") {
+                store.openFolderPanel()
+            }
+            HeaderDivider()
+            HeaderButton("chevron.left", help: "上一张 (←)",
+                         disabled: !store.canStep(-1)) { store.step(-1) }
+            HeaderButton("chevron.right", help: "下一张 (→)",
+                         disabled: !store.canStep(1)) { store.step(1) }
+            HeaderDivider()
+            HeaderButton("minus.magnifyingglass", help: "缩小 (⌘-)",
+                         disabled: store.currentImage == nil) { store.requestZoom(.zoomOut) }
+            HeaderButton("plus.magnifyingglass", help: "放大 (⌘=)",
+                         disabled: store.currentImage == nil) { store.requestZoom(.zoomIn) }
+            HeaderDivider()
+            HeaderButton("rotate.right", help: "顺时针旋转 90°",
+                         disabled: store.currentImage == nil) { store.requestRotate() }
+            HeaderButton("crop", help: "裁切 (C)",
+                         disabled: store.currentImage == nil) { store.requestCrop() }
+            HeaderButton("printer", help: "打印 (⌘P)",
+                         disabled: store.currentImage == nil) { store.requestPrint() }
+            HeaderButton("info.circle", help: "图片信息 (I)") {
+                store.showInspector.toggle()
+            }
+            HeaderDivider()
+            HeaderButton(
+                store.isImmersive ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                help: store.isImmersive ? "退出只看图 (Esc / F)" : "只看图,隐藏所有界面 (F)",
+                disabled: store.currentImage == nil && !store.isImmersive
+            ) { store.toggleImmersive() }
+        }
     }
 }
 
@@ -146,74 +172,87 @@ private struct HeaderDivider: View {
     var body: some View { Divider().frame(height: 13) }
 }
 
-private struct WindowControls: View {
-    @Environment(\.controlActiveState) private var active
-    @Environment(\.dismiss) private var dismiss
-    @State private var hovering = false
-    private var window: NSWindow? {
-        NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: \.isVisible)
+/// 把窗口自带的关闭/最小化/缩放按钮嵌进自定义顶栏,保留系统绘制、悬停符号和无障碍。
+struct NativeTrafficLights: NSViewRepresentable {
+    static let width: CGFloat = 56
+    static let height: CGFloat = 16
+
+    func makeNSView(context: Context) -> NativeTrafficLightsView {
+        NativeTrafficLightsView()
     }
-    private var isKey: Bool { active == .key }
-    var body: some View {
-        HStack(spacing: 8) {
-            Button {
-                if let w = window {
-                    w.close()
-                    // 仅当关闭的是最后一个可见普通窗口时才退出，避免 Inspector/预览窗口误杀
-                    DispatchQueue.main.async {
-                        let visibleNormal = NSApp.windows.filter { $0.isVisible && $0.level == .normal && $0.styleMask.contains(.titled) }
-                        if visibleNormal.isEmpty { NSApp.terminate(nil) }
-                    }
-                } else {
-                    dismiss()
-                }
-            } label: {
-                ZStack {
-                    Circle().fill(isKey ? Color(red: 0.98, green: 0.37, blue: 0.33) : Color.gray.opacity(0.32))
-                    Circle().stroke(Color.black.opacity(isKey ? 0.12 : 0.08), lineWidth: 0.5)
-                    if hovering && isKey {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 7, weight: .bold))
-                            .foregroundStyle(Color.black.opacity(0.62))
-                    }
-                }
-                .frame(width: 12, height: 12)
-            }
-            .buttonStyle(.plain)
-            .help("关闭")
-            Button {
-                window?.miniaturize(nil)
-            } label: {
-                ZStack {
-                    Circle().fill(isKey ? Color(red: 0.99, green: 0.76, blue: 0.20) : Color.gray.opacity(0.32))
-                    Circle().stroke(Color.black.opacity(isKey ? 0.12 : 0.08), lineWidth: 0.5)
-                    if hovering && isKey {
-                        Image(systemName: "minus")
-                            .font(.system(size: 7, weight: .bold))
-                            .foregroundStyle(Color.black.opacity(0.62))
-                    }
-                }
-                .frame(width: 12, height: 12)
-            }
-            .buttonStyle(.plain)
-            .help("最小化")
-            Button {
-                window?.zoom(nil)
-            } label: {
-                ZStack {
-                    Circle().fill(isKey ? Color(red: 0.18, green: 0.78, blue: 0.26) : Color.gray.opacity(0.32))
-                    Circle().stroke(Color.black.opacity(isKey ? 0.12 : 0.08), lineWidth: 0.5)
-                    if hovering && isKey {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.system(size: 6.5, weight: .bold))
-                            .foregroundStyle(Color.black.opacity(0.62))
-                    }
-                }
-                .frame(width: 12, height: 12)
-            }
-            .buttonStyle(.plain)
-            .help("缩放")
-        }
-        .onHover { hovering = $0 }
+
+    func updateNSView(_ nsView: NativeTrafficLightsView, context: Context) {
+        nsView.embedButtons()
     }
 }
+
+final class NativeTrafficLightsView: NSView {
+    private var tracking: NSTrackingArea?
+    private var hovering = false
+    private static let buttonSpacing: CGFloat = 8
+    private static let mouseInGroup = NSSelectorFromString("_setMouseInGroup:")
+
+    override var isOpaque: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        embedButtons()
+        DispatchQueue.main.async { [weak self] in self?.embedButtons() }
+    }
+
+    override func layout() {
+        super.layout()
+        embedButtons()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        applyGroupHover()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        applyGroupHover()
+    }
+
+    func embedButtons() {
+        guard let window else { return }
+        let types: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+        var x: CGFloat = 0
+        for type in types {
+            guard let button = window.standardWindowButton(type) else { continue }
+            if button.superview !== self {
+                button.removeFromSuperview()
+                addSubview(button)
+            }
+            button.isHidden = false
+            let size = button.frame.size.width > 1 ? button.frame.size : NSSize(width: 14, height: 16)
+            let y = ((bounds.height - size.height) / 2).rounded(.toNearestOrAwayFromZero)
+            button.setFrameOrigin(NSPoint(x: x, y: max(0, y)))
+            x += size.width + Self.buttonSpacing
+        }
+        applyGroupHover()
+    }
+
+    private func applyGroupHover() {
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window?.standardWindowButton(type),
+                  button.responds(to: Self.mouseInGroup) else { continue }
+            button.perform(Self.mouseInGroup, with: NSNumber(value: hovering))
+        }
+    }
+}
+

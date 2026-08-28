@@ -28,6 +28,56 @@ struct ImageInfo {
 /// CGImageSource 属性解析 → 信息面板数据(文件 / 图像 / EXIF / GPS)
 enum MetadataService {
 
+    /// EXIF/TIFF 拍摄时间字符串 → Date。常见格式 `yyyy:MM:dd HH:mm:ss`(也接受 `-` / `T`),无时区按本地理解。
+    /// 纯函数、无共享 DateFormatter,可并行调用。
+    static func parseEXIFDate(_ raw: String) -> Date? {
+        let chars = Array(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard chars.count >= 19 else { return nil }
+        func digits(_ start: Int, _ count: Int) -> Int? {
+            var value = 0
+            for i in 0..<count {
+                guard let n = chars[start + i].wholeNumberValue else { return nil }
+                value = value * 10 + n
+            }
+            return value
+        }
+        guard let year = digits(0, 4),
+              let month = digits(5, 2),
+              let day = digits(8, 2),
+              let hour = digits(11, 2),
+              let minute = digits(14, 2),
+              let second = digits(17, 2) else { return nil }
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = day
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = second
+        return Calendar.current.date(from: comps)
+    }
+
+    /// 读拍摄时间:DateTimeOriginal → DateTimeDigitized → TIFF DateTime。只读属性,不解码像素。
+    static func captureDate(of url: URL) -> Date? {
+        let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary) else { return nil }
+        let props = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]) ?? [:]
+        if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+            if let s = exif[kCGImagePropertyExifDateTimeOriginal] as? String, let d = parseEXIFDate(s) {
+                return d
+            }
+            if let s = exif[kCGImagePropertyExifDateTimeDigitized] as? String, let d = parseEXIFDate(s) {
+                return d
+            }
+        }
+        if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
+           let s = tiff[kCGImagePropertyTIFFDateTime] as? String,
+           let d = parseEXIFDate(s) {
+            return d
+        }
+        return nil
+    }
+
     static func formatName(of typeID: String?) -> String {
         guard let typeID else { return "未知" }
         switch typeID {

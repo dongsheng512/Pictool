@@ -51,14 +51,40 @@ final class FolderStore {
     var sidebarVisible = true
     private var sidebarBeforeImmersive = true
 
+    /// 切图到首尾后是否循环(偏好设置)
+    var wrapNavigation: Bool = {
+        guard UserDefaults.standard.object(forKey: WrapNavigation.storageKey) != nil else {
+            return WrapNavigation.defaultValue
+        }
+        return UserDefaults.standard.bool(forKey: WrapNavigation.storageKey)
+    }()
+    /// 当前列表排序(偏好设置;列表变更时沿用)
+    private(set) var sortPreference = ImageSortPreference.load()
+
     /// 单张/少量打开模式：默认不加载同目录所有图片，侧边提示按需加载
     private(set) var isSingleImageMode = false
     private(set) var singleImageSourceFolder: URL?
+    /// 文件夹图片总数缓存,避免 pendingOtherCount 每次扫盘
+    private var folderImageCountCache: [URL: Int] = [:]
+    private var sortGeneration = 0
+
     var pendingOtherCount: Int {
         guard isSingleImageMode, let folder = singleImageSourceFolder else { return 0 }
-        let all = ImageDiscovery.images(in: folder).count
+        let all = cachedImageCount(in: folder)
         let hidden = hiddenByFolder[standardized(folder)]?.count ?? 0
         return max(0, all - hidden - images.count)
+    }
+
+    private func cachedImageCount(in folder: URL) -> Int {
+        let key = standardized(folder)
+        if let cached = folderImageCountCache[key] { return cached }
+        let count = ImageDiscovery.imageCount(in: folder)
+        folderImageCountCache[key] = count
+        return count
+    }
+
+    private func rememberFolderCount(_ folder: URL, _ count: Int) {
+        folderImageCountCache[standardized(folder)] = count
     }
 
     func toggleImmersive() {
@@ -163,14 +189,18 @@ final class FolderStore {
             .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
         guard !imageURLs.isEmpty else { return }
         // 统一用 standardized，便于去重与比较
-        let unique = Array(Set(imageURLs)).sorted { ImageDiscovery.naturalLess($0.lastPathComponent, $1.lastPathComponent) }
+        let unique = ImageDiscovery.sorted(
+            Array(Set(imageURLs)),
+            by: ImageSortPreference(key: .name, direction: sortPreference.direction)
+        )
         // 是否同目录
         let firstFolder = unique[0].deletingLastPathComponent().standardizedFileURL
         let sameFolder = unique.allSatisfy { $0.deletingLastPathComponent().standardizedFileURL == firstFolder }
 
         // 同路径已打开时的增量/跳转逻辑
         if sameFolder {
-            let allImages = ImageDiscovery.images(in: firstFolder)
+            let allImages = ImageDiscovery.images(in: firstFolder, sortedBy: sortPreference)
+            rememberFolderCount(firstFolder, allImages.count)
             let hidden = hiddenByFolder[standardized(firstFolder)] ?? []
             let filteredAll = allImages.filter { !hidden.contains(standardized($0.url)) }
             let filteredSet = Set(filteredAll.map { $0.id })
@@ -199,7 +229,7 @@ final class FolderStore {
                     return
                 }
                 // 未全量：合并后仍保持单图模式，保留之前已打开的
-                let combined = combinedSet.sorted { ImageDiscovery.naturalLess($0.lastPathComponent, $1.lastPathComponent) }.map { ImageFile(id: $0) }
+                let combined = ImageDiscovery.sorted(Array(combinedSet), by: sortPreference).map { ImageFile(id: $0) }
                 let node = ensureRoot(firstFolder)
                 selectedFolderID = node.id
                 // 保持单图模式
@@ -306,15 +336,12 @@ final class FolderStore {
         // 取消旧缩略图队列，避免 1000 张切盘时积压
         ThumbnailProvider.shared.cancelAll()
         DisplayImageCache.shared.cancelAll()
-        images = ImageDiscovery.images(in: node.url).filter { !hidden.contains(standardized($0.url)) }
-        if let remembered = selectionMemory[key],
-           images.contains(where: { standardized($0.id) == remembered }) {
-            selectedImageID = remembered
-        } else {
-            selectedImageID = images.first?.id
-        }
-        if let sel = selectedImageID { selectionMemory[key] = standardized(sel) }
-        prefetchNeighbors()
+        let urls = ImageDiscovery.imageURLs(in: node.url)
+        rememberFolderCount(node.url, urls.count)
+        applySortedURLs(
+            urls.filter { !hidden.contains(standardized($0)) },
+            remembered: selectionMemory[key]
+        )
     }
 
         func selectImage(_ id: ImageFile.ID, direction: Int = 0) {
@@ -327,21 +354,74 @@ final class FolderStore {
         prefetchNeighbors()
     }
 
-    /// 步进切换(首尾循环)
+    /// 步进切换;循环由 wrapNavigation 控制
     func step(_ delta: Int) {
-        guard !images.isEmpty, currentIndex >= 0 else {
-            if !images.isEmpty { selectImage(images[0].id, direction: delta) }
+        guard !images.isEmpty else { return }
+        if currentIndex < 0 {
+            selectImage(images[0].id, direction: delta)
             return
         }
-        let count = images.count
-        let idx = ((currentIndex + delta) % count + count) % count
+        guard let idx = ImageNavigation.nextIndex(
+            current: currentIndex, count: images.count, delta: delta, wrap: wrapNavigation
+        ), idx != currentIndex else { return }
         lastStepDirection = delta > 0 ? 1 : (delta < 0 ? -1 : 0)
         selectImage(images[idx].id, direction: lastStepDirection)
+    }
+
+    func canStep(_ delta: Int) -> Bool {
+        guard let idx = ImageNavigation.nextIndex(
+            current: currentIndex, count: images.count, delta: delta, wrap: wrapNavigation
+        ) else { return false }
+        return idx != currentIndex
+    }
+
+    func applySortPreference(_ preference: ImageSortPreference) {
+        guard preference != sortPreference else { return }
+        sortPreference = preference
+        guard !images.isEmpty else { return }
+        applySortedURLs(images.map(\.url), remembered: selectedImageID)
+    }
+
+    /// 同步排出即时序(文件名/时间/大小);拍摄时间先按文件名显示,后台读 EXIF 再重排。
+    private func applySortedURLs(_ urls: [URL], remembered: URL?) {
+        sortGeneration += 1
+        let gen = sortGeneration
+        let pref = sortPreference
+
+        func finish(_ files: [ImageFile]) {
+            images = files
+            if let remembered, images.contains(where: { standardized($0.id) == standardized(remembered) }) {
+                selectedImageID = remembered
+            } else if selectedImageID == nil || !images.contains(where: { $0.id == selectedImageID }) {
+                selectedImageID = images.first?.id
+            }
+            if let sel = selectedImageID, let folder = selectedFolder?.url {
+                selectionMemory[standardized(folder)] = standardized(sel)
+            }
+            prefetchNeighbors()
+        }
+
+        if pref.key == .captured {
+            let namePref = ImageSortPreference(key: .name, direction: pref.direction)
+            finish(ImageDiscovery.sorted(urls, by: namePref).map { ImageFile(id: $0) })
+            Task { [weak self] in
+                let sorted = await Task.detached(priority: .utility) {
+                    ImageDiscovery.sorted(urls, by: pref)
+                }.value
+                await MainActor.run {
+                    guard let self, self.sortGeneration == gen else { return }
+                    finish(sorted.map { ImageFile(id: $0) })
+                }
+            }
+        } else {
+            finish(ImageDiscovery.sorted(urls, by: pref).map { ImageFile(id: $0) })
+        }
     }
 
     /// 一期手动刷新当前文件夹(不做实时监听)
     func refreshCurrentFolder() {
         guard let node = selectedFolder else { return }
+        folderImageCountCache.removeValue(forKey: standardized(node.url))
         selectFolder(node)
     }
 
@@ -425,6 +505,12 @@ final class FolderStore {
             alert.informativeText = error.localizedDescription
             alert.runModal()
             return
+        }
+        if let folder = selectedFolder?.url {
+            let key = standardized(folder)
+            if let count = folderImageCountCache[key] {
+                folderImageCountCache[key] = max(0, count - 1)
+            }
         }
         removeFromImages(id)
     }

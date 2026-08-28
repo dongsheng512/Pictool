@@ -40,21 +40,60 @@ enum ImageDiscovery {
         urls.sorted { naturalLess($0.lastPathComponent, $1.lastPathComponent) }
     }
 
-    /// 列出文件夹内的图片(不递归、跳过隐藏文件)
-    /// 增量友好：先用 enumerator 快速拿 URL，再并行判文件类型，避免单线程 isDirectory 阻塞
-    static func images(in folder: URL) -> [ImageFile] {
+    /// 排序用的稳定键(缺失拍摄时间时回退到修改时间)
+    struct SortRecord: Equatable {
+        let url: URL
+        let modified: Date
+        let size: Int64
+        let captured: Date?
+        var name: String { url.lastPathComponent }
+    }
+
+    static func compare(_ a: SortRecord, _ b: SortRecord, by preference: ImageSortPreference) -> Bool {
+        let nameLess = naturalLess(a.name, b.name)
+        let ascending = preference.direction == .ascending
+        func ordered<T: Comparable>(_ lhs: T, _ rhs: T) -> Bool {
+            if lhs == rhs { return nameLess }
+            return ascending ? lhs < rhs : lhs > rhs
+        }
+        switch preference.key {
+        case .name:
+            return ascending ? nameLess : naturalLess(b.name, a.name)
+        case .modified:
+            return ordered(a.modified, b.modified)
+        case .size:
+            return ordered(a.size, b.size)
+        case .captured:
+            let ad = a.captured ?? a.modified
+            let bd = b.captured ?? b.modified
+            return ordered(ad, bd)
+        }
+    }
+
+    static func sorted(_ urls: [URL], by preference: ImageSortPreference) -> [URL] {
+        switch preference.key {
+        case .name:
+            let named = sortedByName(urls)
+            return preference.direction == .ascending ? named : Array(named.reversed())
+        case .modified, .size, .captured:
+            return makeRecords(urls, includeCapture: preference.key == .captured)
+                .sorted { compare($0, $1, by: preference) }
+                .map(\.url)
+        }
+    }
+
+    /// 列出文件夹内图片 URL(不排序)。拍摄时间排序请先拿 URL 再在后台 `sorted`。
+    static func imageURLs(in folder: URL) -> [URL] {
         guard let items = try? FileManager.default.contentsOfDirectory(
             at: folder,
-            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
-        // 并行过滤：isDirectory/isRegularFile 涉及 stat，并行可提速 2-3 倍（1000 张盘）
         var candidates: [URL] = []
         candidates.reserveCapacity(items.count)
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: items.count) { i in
             let url = items[i]
-            // 快速路径：先看扩展名，非已知图片直接跳过 stat
             let ext = url.pathExtension.lowercased()
             let maybeImage = ext.isEmpty ? false : (knownExtensions.contains(ext) || UTType(filenameExtension: ext)?.conforms(to: .image) == true)
             if !maybeImage { return }
@@ -67,8 +106,40 @@ enum ImageDiscovery {
             }
         }
         return candidates
-            .sorted { naturalLess($0.lastPathComponent, $1.lastPathComponent) }
-            .map { ImageFile(id: $0) }
+    }
+
+    static func imageCount(in folder: URL) -> Int {
+        imageURLs(in: folder).count
+    }
+
+    private static func makeRecords(_ urls: [URL], includeCapture: Bool) -> [SortRecord] {
+        var records = Array<SortRecord?>(repeating: nil, count: urls.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: urls.count) { i in
+            let url = urls[i]
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let record = SortRecord(
+                url: url,
+                modified: values?.contentModificationDate ?? .distantPast,
+                size: Int64(values?.fileSize ?? 0),
+                captured: includeCapture ? MetadataService.captureDate(of: url) : nil
+            )
+            lock.lock()
+            records[i] = record
+            lock.unlock()
+        }
+        return records.compactMap { $0 }
+    }
+
+    /// 列出文件夹内的图片(不递归、跳过隐藏文件)
+    /// 增量友好：先用 enumerator 快速拿 URL，再并行判文件类型，避免单线程 isDirectory 阻塞
+    static func images(in folder: URL, sortedBy preference: ImageSortPreference = .default) -> [ImageFile] {
+        let urls = imageURLs(in: folder)
+        if preference.key == .captured {
+            return sorted(urls, by: ImageSortPreference(key: .name, direction: preference.direction))
+                .map { ImageFile(id: $0) }
+        }
+        return sorted(urls, by: preference).map { ImageFile(id: $0) }
     }
 
     static func subfolders(in folder: URL) -> [URL] {
