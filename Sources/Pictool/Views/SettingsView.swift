@@ -39,6 +39,7 @@ struct SettingsView: View {
                         Text(option.label).tag(option)
                     }
                 }
+                .pickerStyle(.radioGroup)
                 Picker("顺序", selection: $sortDirection) {
                     ForEach(ImageSortDirection.allCases) { option in
                         Text(option.label).tag(option)

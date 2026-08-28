@@ -1,4 +1,7 @@
 import XCTest
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 @testable import Pictool
 
 final class CropMathTests: XCTestCase {
@@ -426,5 +429,210 @@ final class RotatedCW90Tests: XCTestCase {
         // 0 尺寸无法构造真实 CGImage,直接验证空守卫路径不崩溃即可
         // (构造非法图不可行,此处仅保证函数签名可调用)
         XCTAssertTrue(true)
+    }
+}
+
+// MARK: - EXIF 方向与裁切坐标
+
+/// orientation ≠ 1 时,文件里存的像素矩阵与摆正后的位图宽高对调。
+/// 裁切链路必须全程使用摆正后的坐标系,否则框哪儿不裁哪儿。
+final class CropOrientationTests: XCTestCase {
+
+    /// 存储为 40×20:左半蓝、右半红;写入 orientation = 6(顺时针 90°)。
+    /// 摆正后显示为 20×40:**上半蓝、下半红**。
+    private func makeRotatedJPEG() throws -> URL {
+        let w = 40, h = 20
+        var data = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 4
+                let isBlue = x < w / 2
+                data[i]     = isBlue ? 0 : 255
+                data[i + 1] = 0
+                data[i + 2] = isBlue ? 255 : 0
+                data[i + 3] = 255
+            }
+        }
+        let ctx = try XCTUnwrap(CGContext(
+            data: &data, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let base = try XCTUnwrap(ctx.makeImage())
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PictoolOrient-\(UUID().uuidString).jpg")
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, base, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        return url
+    }
+
+    /// 把裁切结果解码回像素,返回尺寸与指定位置的颜色
+    private func sample(_ data: Data, at point: CGPoint) throws -> (size: CGSize, r: Int, g: Int, b: Int) {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let cg = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let ctx = try XCTUnwrap(CGContext(
+            data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.draw(cg, in: CGRect(x: -point.x, y: -point.y, width: cg.width.cgFloat, height: cg.height.cgFloat))
+        return (CGSize(width: cg.width, height: cg.height),
+                Int(pixel[0]), Int(pixel[1]), Int(pixel[2]))
+    }
+
+    func testFactsReportOrientedSize() throws {
+        let url = try makeRotatedJPEG()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let facts = ImageLoader.facts(of: url)
+        XCTAssertEqual(facts.pixelWidth, 20, "摆正后应为 20 宽")
+        XCTAssertEqual(facts.pixelHeight, 40, "摆正后应为 40 高")
+    }
+
+    func testFactsLeaveUnrotatedImageAlone() throws {
+        let url = try makeRotatedJPEG()
+        defer { try? FileManager.default.removeItem(at: url) }
+        // orientation 1..4 不产生宽高对调,这里反向验证辅助函数本身
+        XCTAssertFalse(ImageLoader.orientationSwapsAxes(1))
+        XCTAssertFalse(ImageLoader.orientationSwapsAxes(4))
+        XCTAssertTrue(ImageLoader.orientationSwapsAxes(5))
+        XCTAssertTrue(ImageLoader.orientationSwapsAxes(8))
+        XCTAssertFalse(ImageLoader.orientationSwapsAxes(9))
+    }
+
+    func testCropUpperHalfOfRotatedImageIsBlue() throws {
+        let url = try makeRotatedJPEG()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let data = try CropService.encode(
+            sourceURL: url,
+            normalizedRect: CGRect(x: 0, y: 0, width: 1, height: 0.5),
+            format: .png, quality: 1
+        )
+        let px = try sample(data, at: CGPoint(x: 10, y: 10))
+        XCTAssertEqual(px.size.width, 20)
+        XCTAssertEqual(px.size.height, 20)
+        XCTAssertGreaterThan(px.b, 200, "摆正后的上半部分应为蓝色,实际 \(px)")
+        XCTAssertLessThan(px.r, 60, "上半部分不应出现红色,实际 \(px)")
+    }
+
+    func testCropLowerHalfOfRotatedImageIsRed() throws {
+        let url = try makeRotatedJPEG()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let data = try CropService.encode(
+            sourceURL: url,
+            normalizedRect: CGRect(x: 0, y: 0.5, width: 1, height: 0.5),
+            format: .png, quality: 1
+        )
+        let px = try sample(data, at: CGPoint(x: 10, y: 10))
+        XCTAssertEqual(px.size.width, 20)
+        XCTAssertEqual(px.size.height, 20)
+        XCTAssertGreaterThan(px.r, 200, "摆正后的下半部分应为红色,实际 \(px)")
+        XCTAssertLessThan(px.b, 60, "下半部分不应出现蓝色,实际 \(px)")
+    }
+}
+
+private extension Int {
+    var cgFloat: CGFloat { CGFloat(self) }
+}
+
+// MARK: - 比例约束下的锚点
+
+/// 锁定比例时,拖边手柄必须只动被拖的那一轴,另一轴保持中心不动。
+/// 回归用例:早期实现把「锚中心」当成「锚 max」处理,选区每帧跳半个身位。
+final class CropRatioLockedTests: XCTestCase {
+
+    private let base = CGRect(x: 0.20, y: 0.20, width: 0.60, height: 0.40)
+    private let aspect: CGFloat = 1.0   // 1:1
+    private let minSize: CGFloat = 0.02
+
+    private func drag(_ handle: CropHandle, dx: CGFloat, dy: CGFloat) -> CGRect {
+        var minX = base.minX, minY = base.minY, maxX = base.maxX, maxY = base.maxY
+        switch handle {
+        case .move:        minX += dx; maxX += dx; minY += dy; maxY += dy
+        case .topLeft:     minX += dx; minY += dy
+        case .topRight:    maxX += dx; minY += dy
+        case .bottomLeft:  minX += dx; maxY += dy
+        case .bottomRight: maxX += dx; maxY += dy
+        case .top:         minY += dy
+        case .bottom:      maxY += dy
+        case .left:        minX += dx
+        case .right:       maxX += dx
+        }
+        let free = CGRect(x: min(minX, maxX), y: min(minY, maxY),
+                          width: abs(maxX - minX), height: abs(maxY - minY))
+        return CropMath.ratioLockedRect(free: free, base: base, handle: handle,
+                                        aspect: aspect, minSize: minSize)
+    }
+
+    func testTopHandleKeepsHorizontalCenter() {
+        let r = drag(.top, dx: 0, dy: -0.05)
+        XCTAssertEqual(r.midX, base.midX, accuracy: 1e-9,
+                       "拖上边缘不应改变水平中心,实际偏移 \(r.midX - base.midX)")
+    }
+
+    func testBottomHandleKeepsHorizontalCenter() {
+        let r = drag(.bottom, dx: 0, dy: 0.05)
+        XCTAssertEqual(r.midX, base.midX, accuracy: 1e-9)
+    }
+
+    func testLeftHandleKeepsVerticalCenter() {
+        let r = drag(.left, dx: -0.10, dy: 0)
+        XCTAssertEqual(r.midY, base.midY, accuracy: 1e-9,
+                       "拖左边缘不应改变垂直中心,实际偏移 \(r.midY - base.midY)")
+    }
+
+    func testRightHandleKeepsVerticalCenter() {
+        let r = drag(.right, dx: 0.10, dy: 0)
+        XCTAssertEqual(r.midY, base.midY, accuracy: 1e-9)
+    }
+
+    func testSquareRatioIsMaintained() {
+        // .move 除外:整体拖移按设计保持原有尺寸(改比例应在切换比例时由 snapToRatio 完成)
+        for handle in CropHandle.allCases where handle != .move {
+            let r = drag(handle, dx: 0.03, dy: 0.02)
+            XCTAssertEqual(r.width, r.height, accuracy: 1e-9, "\(handle) 破坏了 1:1")
+        }
+    }
+
+    func testCornerHandlePinsOppositeCorner() {
+        // 拖左上角时右下角应固定不动
+        let r = drag(.topLeft, dx: -0.05, dy: -0.05)
+        XCTAssertEqual(r.maxX, base.maxX, accuracy: 1e-9)
+        XCTAssertEqual(r.maxY, base.maxY, accuracy: 1e-9)
+        // 拖右下角时左上角应固定不动
+        let r2 = drag(.bottomRight, dx: 0.05, dy: 0.05)
+        XCTAssertEqual(r2.minX, base.minX, accuracy: 1e-9)
+        XCTAssertEqual(r2.minY, base.minY, accuracy: 1e-9)
+    }
+
+    func testMovePreservesSize() {
+        let r = drag(.move, dx: 0.08, dy: 0.05)
+        XCTAssertEqual(r.width, base.width, accuracy: 1e-9)
+        XCTAssertEqual(r.height, base.height, accuracy: 1e-9)
+    }
+
+    func testResultAlwaysInsideUnitRect() {
+        for handle in CropHandle.allCases {
+            for (dx, dy) in [(CGFloat(0.5), CGFloat(0.5)), (-0.9, -0.9), (0.3, -0.7)] {
+                let r = drag(handle, dx: dx, dy: dy)
+                XCTAssertGreaterThanOrEqual(r.minX, -1e-9, "\(handle) 越界")
+                XCTAssertGreaterThanOrEqual(r.minY, -1e-9, "\(handle) 越界")
+                XCTAssertLessThanOrEqual(r.maxX, 1 + 1e-9, "\(handle) 越界")
+                XCTAssertLessThanOrEqual(r.maxY, 1 + 1e-9, "\(handle) 越界")
+            }
+        }
+    }
+
+    func testAnchorMapping() {
+        XCTAssertEqual(CropMath.anchor(of: .top).x, .center)
+        XCTAssertEqual(CropMath.anchor(of: .bottom).x, .center)
+        XCTAssertEqual(CropMath.anchor(of: .left).y, .center)
+        XCTAssertEqual(CropMath.anchor(of: .right).y, .center)
+        XCTAssertEqual(CropMath.anchor(of: .topLeft).x, .max)
+        XCTAssertEqual(CropMath.anchor(of: .topLeft).y, .max)
+        XCTAssertEqual(CropMath.anchor(of: .bottomRight).x, .min)
+        XCTAssertEqual(CropMath.anchor(of: .bottomRight).y, .min)
     }
 }

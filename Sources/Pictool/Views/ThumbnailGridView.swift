@@ -17,6 +17,21 @@ struct ThumbnailGridView: View {
                 Text("缩略图")
                     .font(.callout.weight(.semibold))
                 Spacer()
+                // 这里原本有两个 Spacer(),把展开按钮顶到了中间;只保留一个让它靠右
+                Text("\(store.images.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if store.hiddenCountInCurrentFolder > 0 {
+                    Button {
+                        store.unhideAllInCurrentFolder()
+                    } label: {
+                        Text("已隐藏 \(store.hiddenCountInCurrentFolder) · 恢复")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .help("恢复本文件夹中被隐藏的图片")
+                }
                 Button {
                     expanded.toggle()
                 } label: {
@@ -24,10 +39,6 @@ struct ThumbnailGridView: View {
                 }
                 .buttonStyle(FlatPillButtonStyle())
                 .help(expanded ? "复原缩略图区域" : "扩大缩略图区域")
-                Spacer()
-                Text("\(store.images.count)")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -126,6 +137,9 @@ struct ThumbCell: View {
     let isCurrent: Bool
     var isVisible: Bool = false
     @State private var thumb: NSImage?
+    /// 解码失败标记。不记这个的话 thumb 永远是 nil,
+    /// .task(id:) 只在 id 变化时重跑,失败项会永远卡在转圈。
+    @State private var failed = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -135,6 +149,11 @@ struct ThumbCell: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)   // 完整显示整张图,不裁切
                         .padding(2)
+                } else if failed {
+                    // 权限受限 / 文件损坏 / 无法解码的 RAW 会走到这里
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.tertiary)
                 } else {
                     ZStack {
                         Rectangle().fill(.quaternary)
@@ -163,8 +182,14 @@ struct ThumbCell: View {
         )
         .contentShape(Rectangle())
         .task(id: file.id) {
-            if thumb == nil {
-                thumb = await ThumbnailProvider.shared.asyncThumbnail(for: file.url, maxPixel: 180, isVisible: isVisible)
+            guard thumb == nil, !failed else { return }
+            let loaded = await ThumbnailProvider.shared.asyncThumbnail(
+                for: file.url, maxPixel: 180, isVisible: isVisible
+            )
+            if let loaded {
+                thumb = loaded
+            } else {
+                failed = true
             }
         }
     }

@@ -19,6 +19,8 @@ final class FolderNode: Identifiable {
 
 enum ZoomAction: Equatable {
     case fit, actualSize, zoomIn, zoomOut
+    /// 直接跳到某个百分比(1.0 = 实际大小,与状态栏读数同一套语义)
+    case scale(CGFloat)
 }
 
 /// 当前图片的基本显示信息(状态栏/信息面板头部用)
@@ -43,10 +45,15 @@ final class FolderStore {
     var imageLoading = false
     var displayScale: CGFloat = 1
     var displayInfo = DisplayImageInfo()
+    /// 当前显示位图已被用户旋转(纯显示态,切图即丢、不写回文件)
+    var isDisplayRotated = false
 
     var showInspector = false
     /// 只看图:窗口内隐藏顶栏/侧栏/状态栏/信息面板
     var isImmersive = false
+    /// 当前是否有模态面板(裁切 sheet / 打印面板)打开。
+    /// 裸键快捷键(I/C/F/0/1/←/→)此时必须失效,否则会在面板背后改动浏览状态。
+    var isModalPresented = false
     /// 侧栏是否可见(普通模式;纯净模式下强制隐藏,退出后恢复)
     var sidebarVisible = true
     private var sidebarBeforeImmersive = true
@@ -68,19 +75,29 @@ final class FolderStore {
     private var folderImageCountCache: [URL: Int] = [:]
     private var sortGeneration = 0
 
+    /// 同目录还有多少张未加载。只读缓存,绝不在此触发扫盘——
+    /// 这个属性被 body 直接求值,走主线程,上千文件的目录会卡住渲染。
     var pendingOtherCount: Int {
         guard isSingleImageMode, let folder = singleImageSourceFolder else { return 0 }
-        let all = cachedImageCount(in: folder)
+        guard let all = folderImageCountCache[standardized(folder)] else { return 0 }
         let hidden = hiddenByFolder[standardized(folder)]?.count ?? 0
         return max(0, all - hidden - images.count)
     }
 
-    private func cachedImageCount(in folder: URL) -> Int {
-        let key = standardized(folder)
-        if let cached = folderImageCountCache[key] { return cached }
-        let count = ImageDiscovery.imageCount(in: folder)
-        folderImageCountCache[key] = count
-        return count
+    /// 当前文件夹被隐藏的张数(用于侧栏的「恢复」入口)
+    var hiddenCountInCurrentFolder: Int {
+        guard let folder = selectedFolder?.url else { return 0 }
+        return hiddenByFolder[standardized(folder)]?.count ?? 0
+    }
+
+    /// 恢复当前文件夹所有被隐藏的图片(隐藏仅作用于本次浏览)
+    func unhideAllInCurrentFolder() {
+        guard let node = selectedFolder else { return }
+        let key = standardized(node.url)
+        guard hiddenByFolder[key] != nil else { return }
+        hiddenByFolder.removeValue(forKey: key)
+        hiddenByFolderOrder.removeAll { $0 == key }
+        selectFolder(node)
     }
 
     private func rememberFolderCount(_ folder: URL, _ count: Int) {
@@ -418,10 +435,14 @@ final class FolderStore {
         }
     }
 
-    /// 一期手动刷新当前文件夹(不做实时监听)
+    /// 一期手动刷新当前文件夹(不做实时监听)。
+    /// 顺带清掉该文件夹的隐藏集合——否则隐藏在本次会话里无法撤销,只能重启 App。
     func refreshCurrentFolder() {
         guard let node = selectedFolder else { return }
-        folderImageCountCache.removeValue(forKey: standardized(node.url))
+        let key = standardized(node.url)
+        folderImageCountCache.removeValue(forKey: key)
+        hiddenByFolder.removeValue(forKey: key)
+        hiddenByFolderOrder.removeAll { $0 == key }
         selectFolder(node)
     }
 
@@ -497,6 +518,14 @@ final class FolderStore {
     /// 删除图片:移到废纸篓(可从 Finder 恢复);失败时弹窗说明并保留在列表
     func deleteImage(_ id: ImageFile.ID) {
         guard images.contains(where: { $0.id == id }) else { return }
+        // 右键菜单里的破坏性操作,先确认,避免误触
+        let confirm = NSAlert()
+        confirm.messageText = "要把“\(id.lastPathComponent)”移到废纸篓吗?"
+        confirm.informativeText = "可以从废纸篓恢复。"
+        confirm.alertStyle = .warning
+        confirm.addButton(withTitle: "移到废纸篓")
+        confirm.addButton(withTitle: "取消")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
         do {
             try FileManager.default.trashItem(at: id, resultingItemURL: nil)
         } catch {

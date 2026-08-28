@@ -98,7 +98,11 @@ final class ThumbnailProvider: @unchecked Sendable {
     func cancelAll() {
         queue.cancelAllOperations()
         lock.lock()
+        let abandoned = inFlight
         inFlight.removeAll()
         lock.unlock()
+        // 必须把等待者唤醒。withCheckedContinuation 不响应取消,直接丢弃回调数组
+        // 会让每个等待方的 Task 永久挂在 continuation 上——切一次文件夹泄漏一批。
+        for waiters in abandoned.values { for waiter in waiters { waiter(nil) } }
     }
 }

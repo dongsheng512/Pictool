@@ -46,25 +46,26 @@ struct PureHeader: View {
         }
         .frame(height: 32)
         .frame(maxWidth: .infinity)
+        // 拖拽区必须与背景同层且在其之上:分成两个 .background 时后挂的那层在更底下,
+        // 会被不透明的 headerBackground 完全遮住,双击缩放收不到事件。
         .background {
-            headerBackground
-        }
-        .background {
-            // 自定义拖拽区：空白处拖动窗口，双击缩放；按钮区域不受影响
-            Color.clear
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                        .onChanged { _ in
-                            if let window = NSApp.keyWindow ?? NSApp.mainWindow,
-                               let event = NSApp.currentEvent {
-                                window.performDrag(with: event)
+            ZStack {
+                headerBackground
+                // 自定义拖拽区：空白处拖动窗口，双击缩放；按钮区域不受影响
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { _ in
+                                if let window = NSApp.keyWindow ?? NSApp.mainWindow,
+                                   let event = NSApp.currentEvent {
+                                    window.performDrag(with: event)
+                                }
                             }
-                        }
-                )
-                .onTapGesture(count: 2) { NSApp.keyWindow?.zoom(nil) }
+                    )
+                    .onTapGesture(count: 2) { NSApp.keyWindow?.zoom(nil) }
+            }
         }
-
     }
 
     @ViewBuilder

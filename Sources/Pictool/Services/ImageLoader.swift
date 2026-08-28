@@ -15,12 +15,29 @@ enum ImageLoadError: LocalizedError {
 enum ImageLoader {
 
     struct SourceFacts: Sendable {
+        /// 摆正后的像素尺寸(已按 EXIF 方向对调),与实际解码得到的位图一致
         var pixelWidth = 0
         var pixelHeight = 0
         var frameCount = 1
         var formatID: String?
 
         var maxPixel: CGFloat { CGFloat(max(pixelWidth, pixelHeight)) }
+    }
+
+    /// EXIF 方向是否让宽高对调。
+    /// 5/6/7/8 表示像素矩阵被旋转 ±90° 存储,解码时 `CreateThumbnailWithTransform`
+    /// 会摆正位图,于是输出的宽高是文件里存的反过来。
+    static func orientationSwapsAxes(_ orientation: Int) -> Bool {
+        (5...8).contains(orientation)
+    }
+
+    /// 读取顶层 EXIF 方向。ImageIO 会把 TIFF/EXIF 里的方向归一化到顶层键,
+    /// 缺失时按 1(无需旋转)处理。
+    static func orientation(from properties: [CFString: Any]) -> Int {
+        if let value = properties[kCGImagePropertyOrientation] as? Int { return value }
+        if let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
+           let value = tiff[kCGImagePropertyTIFFOrientation] as? Int { return value }
+        return 1
     }
 
     /// 已缓存的降采样图是否足以满足本次请求(全尺寸或覆盖请求边长 / 真实边长)
@@ -113,8 +130,13 @@ enum ImageLoader {
         facts.frameCount = CGImageSourceGetCount(source)
         facts.formatID = CGImageSourceGetType(source) as String?
         if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
-            facts.pixelWidth = props[kCGImagePropertyPixelWidth] as? Int ?? 0
-            facts.pixelHeight = props[kCGImagePropertyPixelHeight] as? Int ?? 0
+            let storedWidth = props[kCGImagePropertyPixelWidth] as? Int ?? 0
+            let storedHeight = props[kCGImagePropertyPixelHeight] as? Int ?? 0
+            // 解码一律走 WithTransform,位图是摆正后的。
+            // 尺寸也按摆正后的语义给出,否则裁切坐标、缩放读数、升级判定都会落在另一套坐标系上。
+            let swap = orientationSwapsAxes(orientation(from: props))
+            facts.pixelWidth = swap ? storedHeight : storedWidth
+            facts.pixelHeight = swap ? storedWidth : storedHeight
         }
         return facts
     }
@@ -166,8 +188,11 @@ final class DisplayImageCache: @unchecked Sendable {
 
     func cancelAll() {
         lock.lock()
+        let abandoned = inFlight
         inFlight.removeAll()
         lock.unlock()
+        // 唤醒等待者:withCheckedContinuation 不响应取消,直接丢弃会让 Task 永久挂起
+        for waiters in abandoned.values { for waiter in waiters { waiter(nil) } }
     }
 
     func clearIfMemoryPressure() {

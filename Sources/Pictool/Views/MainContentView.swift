@@ -10,6 +10,7 @@ struct MainContentView: View {
     @State private var showCropSheet = false
     @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
+    @State private var isDropTargeted = false
     @State private var sidebarWidth: CGFloat = UserDefaults.standard.double(forKey: "sidebarWidth") > 0 ? UserDefaults.standard.double(forKey: "sidebarWidth") : 260
     @State private var dragStartWidth: CGFloat = 260
     @State private var isHoveringDivider = false
@@ -51,11 +52,27 @@ struct MainContentView: View {
             store.applySortPreference(sortPreference)
         }
         .onOpenURL { url in handleExternal(url) }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers)
         }
         .overlay {
-            if isPreparingPrint { ProgressView("正在准备打印…") }
+            ZStack {
+                if isPreparingPrint {
+                    ProgressView("正在准备打印…")
+                        .padding(14)
+                        // 加深色画布上也要能看清,给进度条一层材质底
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }
+        // 拖入高亮:此前 isTargeted 传的是 nil,用户拖着文件进来没有任何反馈
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
         }
         .overlay(alignment: .topTrailing) {
             if store.isImmersive {
@@ -92,6 +109,7 @@ struct MainContentView: View {
                 onLoadingChange: { store.imageLoading = $0 },
                 onScaleChange: { store.displayScale = $0 },
                 onImageInfo: { store.displayInfo = $0 },
+                onRotationChange: { store.isDisplayRotated = $0 },
                 onStep: { store.step($0) }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -142,10 +160,15 @@ struct MainContentView: View {
                         InfoInspector(file: store.currentImage)
                     }
                     .sheet(isPresented: $showCropSheet) {
-                        if let file = store.currentImage { CropView(file: file) }
+                        if let file = store.currentImage {
+                            CropView(file: file, isDisplayRotated: store.isDisplayRotated)
+                        }
                     }
                     .onChange(of: store.cropRequestToken) { _, _ in
                         showCropSheet = store.currentImage != nil
+                    }
+                    .onChange(of: showCropSheet) { _, presented in
+                        store.isModalPresented = presented
                     }
                     .onChange(of: store.printRequestToken) { _, _ in
                         prepareAndPrint()
@@ -165,15 +188,19 @@ struct MainContentView: View {
     private func prepareAndPrint() {
         guard let file = store.currentImage, !isPreparingPrint else { return }
         isPreparingPrint = true
+        store.isModalPresented = true
         let url = file.url
         Task {
             let image = await Task.detached(priority: .userInitiated) {
                 try? ImageLoader.decode(url: url, maxPixelSize: nil)
             }.value
             isPreparingPrint = false
+            // 打印面板是模态的,从 runModal 返回即代表已关闭
+            store.isModalPresented = false
             guard let image else { return }
             await MainActor.run {
                 PrintService.print(image: image)
+                store.isModalPresented = false
             }
         }
     }
@@ -194,9 +221,30 @@ struct MainContentView: View {
                     onLoadingChange: { store.imageLoading = $0 },
                     onScaleChange: { store.displayScale = $0 },
                     onImageInfo: { store.displayInfo = $0 },
+                    onRotationChange: { store.isDisplayRotated = $0 },
                     onStep: { store.step($0) }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contextMenu {
+                    if let file = store.currentImage {
+                        Button { store.copyImageToPasteboard(file.id) } label: {
+                            Label("复制图片", systemImage: "doc.on.doc")
+                        }
+                        Button { NSWorkspace.shared.activateFileViewerSelecting([file.url]) } label: {
+                            Label("在 Finder 中显示", systemImage: "folder")
+                        }
+                        Divider()
+                        Button { store.requestRotate() } label: {
+                            Label("顺时针旋转 90°", systemImage: "rotate.right")
+                        }
+                        Button { store.requestCrop() } label: {
+                            Label("裁切…", systemImage: "crop")
+                        }
+                        Button { store.requestPrint() } label: {
+                            Label("打印…", systemImage: "printer")
+                        }
+                    }
+                }
 
                 if store.roots.isEmpty {
                     welcomeOverlay
@@ -308,6 +356,17 @@ struct MainContentView: View {
                     }
                 }
 
+                // 旋转只是显示态,切图即丢、不写回文件;这里如实标注,避免用户误以为已保存
+                if store.isDisplayRotated {
+                    statusBarDivider
+                    HStack(spacing: 3) {
+                        Image(systemName: "rotate.right")
+                            .font(.system(size: 9))
+                        Text("已旋转(未保存)")
+                    }
+                    .foregroundStyle(.secondary)
+                }
+
                 statusBarDivider
                 // 导航组
                 Text("\(store.currentIndex + 1) / \(store.images.count)")
@@ -377,6 +436,13 @@ struct MainContentView: View {
             ZoomMenuItem("实际大小 (100%)") {
                 showZoomMenu = false
                 store.requestZoom(.actualSize)
+            }
+            Divider().padding(.vertical, 2)
+            ForEach([0.5, 1.0, 2.0], id: \.self) { factor in
+                ZoomMenuItem("\(Int((factor * 100).rounded()))%") {
+                    showZoomMenu = false
+                    store.requestZoom(.scale(factor))
+                }
             }
         }
         .padding(6)
@@ -492,6 +558,10 @@ private final class ChromeView: NSView {
     private func stripTitlebar() {
         guard let window else { return }
         window.styleMask.insert(.fullSizeContentView)
+        // 记住窗口位置与尺寸,下次启动恢复到上次的位置
+        if window.frameAutosaveName.isEmpty {
+            window.setFrameAutosaveName("MainWindow")
+        }
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.title = ""

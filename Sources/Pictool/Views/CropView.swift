@@ -6,11 +6,16 @@ import UniformTypeIdentifiers
 struct CropView: View {
 
     let file: ImageFile
+    /// 主视图里已把图旋转过。裁切始终基于磁盘上的原文件,这里如实提示,避免「转了半天白转」。
+    var isDisplayRotated = false
     @Environment(\.dismiss) private var dismiss
 
     @State private var selection = CGRect(x: 0.08, y: 0.08, width: 0.84, height: 0.84)
     @State private var ratio: CropRatio = .free
     @State private var preview: NSImage?
+    /// 原图解码失败。只靠 pixelSize 判断会走进死角:
+    /// 属性读得到、位图解不出,画布永远停在「正在载入」,导出按钮却可用且必失败。
+    @State private var previewFailed = false
     @State private var pixelSize = CGSize.zero
     @State private var exporting = false
     @State private var errorMessage: String?
@@ -19,6 +24,20 @@ struct CropView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if isDisplayRotated {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text("裁切基于磁盘上的原始文件,不含主视图中的旋转")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.08))
+                Divider()
+            }
             topBar
             Divider()
             canvasArea
@@ -47,8 +66,11 @@ struct CropView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 380)
-            .onChange(of: ratio) { _, _ in snapToRatio() }
+            .frame(width: 440)
+            .onChange(of: ratio) { _, newRatio in
+                // 「原始」也要套一次,让选区对齐图片自身比例
+                if newRatio != .free { snapToRatio() }
+            }
 
             Spacer()
 
@@ -57,6 +79,9 @@ struct CropView: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+
+            Button("全选") { selection = CGRect(x: 0, y: 0, width: 1, height: 1) }
+                .disabled(previewFailed)
 
             Button("重置") { selection = CGRect(x: 0.08, y: 0.08, width: 0.84, height: 0.84) }
 
@@ -69,7 +94,7 @@ struct CropView: View {
                 if exporting { ProgressView().controlSize(.small) } else { Text("导出…") }
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(exporting || pixelSize.width == 0)
+            .disabled(exporting || pixelSize.width == 0 || previewFailed)
         }
         .padding(12)
     }
@@ -85,6 +110,14 @@ struct CropView: View {
                     imageAspect: pixelSize.width / pixelSize.height
                 )
                 .padding(20)
+            } else if previewFailed {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.secondary)
+                    Text("无法载入此图的像素数据")
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 ProgressView("正在载入原图…")
             }
@@ -137,6 +170,7 @@ struct CropView: View {
                 return (nil, ImageLoader.facts(of: url))
             }.value
             preview = image
+            previewFailed = image == nil
             pixelSize = CGSize(width: facts.pixelWidth, height: facts.pixelHeight)
             format = CropFormat.default(forSourceExt: url.pathExtension)
         }
@@ -159,6 +193,7 @@ struct CropView: View {
     private func ratioAspect() -> CGFloat {
         switch ratio {
         case .free: return pixelSize.width / max(1, pixelSize.height)
+        case .original: return pixelSize.width / max(1, pixelSize.height)
         case .square: return 1
         case .fourBy3: return 4.0 / 3.0
         case .threeBy4: return 3.0 / 4.0
@@ -205,10 +240,6 @@ struct CropView: View {
 }
 
 // MARK: - 选区画布
-
-private enum HandleKind {
-    case move, topLeft, topRight, bottomLeft, bottomRight, top, bottom, left, right
-}
 
 private struct CropCanvas: View {
 
@@ -286,18 +317,29 @@ private struct CropCanvas: View {
                 .gesture(dragGesture(kind: .move, fit: fit, minNorm: minNorm))
 
             ForEach(Array(handleSpecs(fit: fit, rect: rect).enumerated()), id: \.offset) { _, spec in
-                Rectangle()
-                    .fill(Color.white)
-                    .frame(width: spec.size, height: spec.size)
-                    .shadow(radius: 1)
-                    .position(spec.point)
-                    .gesture(dragGesture(kind: spec.kind, fit: fit, minNorm: minNorm))
+                // 视觉尺寸保持精致,但触控热区放大到 20pt——11pt 的方块很难抓准。
+                // 再加一圈深色描边:纯白手柄在亮色照片上完全看不见。
+                ZStack {
+                    Rectangle()
+                        .fill(Color.white)
+                        .frame(width: spec.size, height: spec.size)
+                        .overlay(
+                            Rectangle()
+                                .strokeBorder(Color.black.opacity(0.55), lineWidth: 0.5)
+                                .frame(width: spec.size, height: spec.size)
+                        )
+                        .shadow(radius: 1)
+                }
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+                .position(spec.point)
+                .gesture(dragGesture(kind: spec.kind, fit: fit, minNorm: minNorm))
             }
         }
     }
 
     private struct HandleSpec {
-        let kind: HandleKind
+        let kind: CropHandle
         let point: CGPoint
         let size: CGFloat
     }
@@ -317,7 +359,7 @@ private struct CropCanvas: View {
         ]
     }
 
-    private func dragGesture(kind: HandleKind, fit: CGRect, minNorm: CGFloat) -> some Gesture {
+    private func dragGesture(kind: CropHandle, fit: CGRect, minNorm: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 if dragBaseline == nil { dragBaseline = selection }
@@ -329,7 +371,7 @@ private struct CropCanvas: View {
             .onEnded { _ in dragBaseline = nil }
     }
 
-    private func apply(kind: HandleKind, base: CGRect, dx: CGFloat, dy: CGFloat, minNorm: CGFloat) {
+    private func apply(kind: CropHandle, base: CGRect, dx: CGFloat, dy: CGFloat, minNorm: CGFloat) {
         var minX = base.minX, minY = base.minY
         var maxX = base.maxX, maxY = base.maxY
         switch kind {
@@ -344,36 +386,22 @@ private struct CropCanvas: View {
         case .left: minX += dx
         case .right: maxX += dx
         }
-        var rect = CGRect(x: min(minX, maxX), y: min(minY, maxY),
+        let free = CGRect(x: min(minX, maxX), y: min(minY, maxY),
                           width: abs(maxX - minX), height: abs(maxY - minY))
 
-        // 比例约束:以拖动对侧的边/角为锚点
-        if ratio != .free {
-            let aspect = ratioAspectValue
-            let anchorX: CGFloat = (kind == .topLeft || kind == .bottomLeft || kind == .left) ? base.maxX
-                : (kind == .right || kind == .topRight || kind == .bottomRight) ? base.minX : rect.midX
-            let anchorY: CGFloat = (kind == .topLeft || kind == .topRight || kind == .top) ? base.maxY
-                : (kind == .bottom || kind == .bottomLeft || kind == .bottomRight) ? base.minY : rect.midY
-            var width = rect.width
-            var height = width / aspect
-            if kind == .top || kind == .bottom {
-                height = rect.height
-                width = height * aspect
-            } else if height > rect.height {
-                height = rect.height
-                width = height * aspect
-            }
-            let x = kind == .move ? rect.midX - width / 2 : anchorX + (anchorX == base.minX ? 0 : -width)
-            let y = kind == .move ? rect.midY - height / 2 : anchorY + (anchorY == base.minY ? 0 : -height)
-            rect = CGRect(x: x, y: y, width: width, height: height)
+        // 比例约束:锚点、尺寸、夹取全部收口在纯函数里(可单测)
+        if ratio == .free {
+            selection = CropMath.clampedNormalized(free, minSize: minNorm)
+        } else {
+            selection = CropMath.ratioLockedRect(free: free, base: base, handle: kind,
+                                                 aspect: ratioAspectValue, minSize: minNorm)
         }
-
-        selection = CropMath.clampedNormalized(rect, minSize: minNorm)
     }
 
     private var ratioAspectValue: CGFloat {
         switch ratio {
         case .free: return imageAspect
+        case .original: return imageAspect
         case .square: return 1
         case .fourBy3: return 4.0 / 3.0
         case .threeBy4: return 3.0 / 4.0

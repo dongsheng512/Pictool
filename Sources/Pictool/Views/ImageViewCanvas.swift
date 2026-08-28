@@ -20,6 +20,8 @@ struct ImageViewCanvas: NSViewRepresentable {
     var onLoadingChange: (Bool) -> Void
     var onScaleChange: (CGFloat) -> Void
     var onImageInfo: (DisplayImageInfo) -> Void
+    /// 当前显示位图是否已被用户旋转。旋转是纯显示态,切图即丢,需要让界面如实告知。
+    var onRotationChange: (Bool) -> Void
     var onStep: (Int) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -78,6 +80,8 @@ struct ImageViewCanvas: NSViewRepresentable {
         private var fitScale: CGFloat = 1
         private var wasFit = true
         private var isFullResolution = false
+        /// 当前图的帧数;动图不参与全尺寸升级(没有更高分辨率,升级只会打断播放)
+        private var frameCount = 1
         private var escalating = false
         private var truePixelSize = CGSize.zero
         /// 当前 imageView 位图的真实像素(旋转后宽高对调;动图帧始终等于 truePixelSize)。
@@ -204,8 +208,14 @@ struct ImageViewCanvas: NSViewRepresentable {
 #endif
         }
 
+        /// 已应用的背景。updateNSView 每次 SwiftUI 重渲染都会跑,
+        /// 不判等的话 clipView 的 didSet 会让画布每帧全量重绘(平滑缩放时尤其明显)。
+        private var appliedBackground: CanvasBackground?
+
         /// 应用画布背景;图片层保持透明以便 PNG 透出背景
         func applyBackground(_ background: CanvasBackground) {
+            guard appliedBackground != background else { return }
+            appliedBackground = background
             scrollView.drawsBackground = true
             scrollView.backgroundColor = background.color
             clipView.drawsBackground = false
@@ -232,6 +242,7 @@ struct ImageViewCanvas: NSViewRepresentable {
                 parent.onLoadingChange(false)
                 parent.onImageInfo(DisplayImageInfo())
                 parent.onScaleChange(1)
+                parent.onRotationChange(false)
                 return
             }
 
@@ -321,6 +332,8 @@ struct ImageViewCanvas: NSViewRepresentable {
             truePixelSize = CGSize(width: facts.pixelWidth, height: facts.pixelHeight)
             bitmapPixelSize = truePixelSize
             isRotatedBitmap = false
+            frameCount = max(1, facts.frameCount)
+            parent.onRotationChange(false)   // 新图从文件解码,不继承上一张的旋转
             parent.onImageInfo(DisplayImageInfo(
                 pixelWidth: facts.pixelWidth,
                 pixelHeight: facts.pixelHeight,
@@ -439,11 +452,26 @@ struct ImageViewCanvas: NSViewRepresentable {
             if abs(scrollView.magnification - 1) > 0.0005 { scrollView.magnification = 1 }
             fitScale = fitScaleValue()
             let backing = scrollView.window?.backingScaleFactor ?? 2
-            scale = 1 / backing
-            wasFit = false
-            updateFrameCentered()
+            applyEffectiveScale(1, backing: backing, animated: false)
             notifyScale()
             scheduleEscalateCheck()
+        }
+
+        /// 按「源像素 : 屏幕物理像素」的倍数缩放(1.0 = 实际大小),与状态栏读数同语义。
+        /// 必须换算回当前位图的坐标系:浏览位图是降采样过的,直接拿 1/backing 当 scale
+        /// 会让 100% 只到 (降采样上限 / 原图尺寸)——4000px 的图在 2x 屏上只有 70%。
+        private func applyEffectiveScale(_ factor: CGFloat, backing: CGFloat, animated: Bool) {
+            guard imageSize.width > 0, truePixelSize.width > 0 else { return }
+            let target = max(factor * truePixelSize.width / backing / imageSize.width, minScale)
+            wasFit = false
+            if animated {
+                startSmoothZoom(to: target, anchor: visibleCenter(), duration: 0.22)
+            } else {
+                // 走 updateFrameCentered 而不是 applyScale:后者在 target == scale 时会提前返回,
+                // 换图后若新旧缩放比恰好相同就会漏掉这次 frame 更新。
+                scale = target
+                updateFrameCentered()
+            }
         }
 
         private func updateFrameCentered() {
@@ -483,6 +511,10 @@ struct ImageViewCanvas: NSViewRepresentable {
             case .zoomOut:
                 absorbMagnification()
                 smoothZoom(multiplyingBy: 0.8, anchor: visibleCenter(), duration: 0.22)
+            case .scale(let factor):
+                absorbMagnification()
+                let backing = scrollView.window?.backingScaleFactor ?? 2
+                applyEffectiveScale(factor, backing: backing, animated: true)
             }
         }
 
@@ -707,17 +739,23 @@ struct ImageViewCanvas: NSViewRepresentable {
         /// 缩放后如果当前表示的像素不足以清晰呈现,加载全尺寸替换(视觉尺寸保持不变)
         private func maybeEscalate() {
             guard !isFullResolution, !escalating, !isRotatedBitmap, zoomTarget == nil,
+                  frameCount <= 1,
                   let image = imageView.image,
                   let rep = image.representations.first, rep.pixelsWide > 0 else { return }
             let backing = scrollView.window?.backingScaleFactor ?? 2
             let displayedPx = imageView.frame.width * backing
-            if displayedPx > bitmapPixelSize.width * 1.05 {
+            // 基准是「当前位图的真实像素」,不是源图像素。
+            // 浏览位图是降采样过的,拿源图尺寸当基准会让 100% 缩放时仍停在插值画质:
+            // 4000px 的图以 2800px 位图显示到 4000 设备像素,判定 4000 > 4200 为假,永远不升级。
+            // 系数 0.9 让全尺寸在到达 100% 之前就位。
+            if displayedPx > CGFloat(rep.pixelsWide) * 0.9 {
                 escalate {}
             }
         }
 
         private func escalate(completion: @escaping () -> Void) {
-            guard let url = currentURL, !escalating else {
+            // 动图跳过:没有更高分辨率可升,解码出来的静态帧会被下一帧动画覆盖
+            guard let url = currentURL, !escalating, frameCount <= 1 else {
                 completion()
                 return
             }
@@ -798,6 +836,7 @@ struct ImageViewCanvas: NSViewRepresentable {
                 self.isFullResolution = true
                 self.applyFit()
             }
+            parent.onRotationChange(true)
         }
     }
 }
@@ -831,8 +870,10 @@ final class CanvasClipView: NSClipView {
     var onHorizontalSwipe: ((Int) -> Void)?
     /// applyDocument 写入期间锁定 origin,防止 constrain 在同一拍改掉取景
     var pinnedOrigin: NSPoint?
-    /// 画布背景(随偏好设置切换)
-    var canvasBackground: CanvasBackground = .dark { didSet { needsDisplay = true } }
+    /// 画布背景(随偏好设置切换)。值没变就别置脏,否则每次 updateNSView 都会整块重绘。
+    var canvasBackground: CanvasBackground = .dark {
+        didSet { if oldValue != canvasBackground { needsDisplay = true } }
+    }
 
     private var swipeAccumulatedDX: CGFloat = 0
     private var swipeGestureActive = false

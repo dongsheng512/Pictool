@@ -81,46 +81,53 @@ struct PictoolApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("打开文件夹…") { store.openFolderPanel() }
                     .keyboardShortcut("o", modifiers: .command)
+                    .disabled(store.isModalPresented)
                 Button("刷新") { store.refreshCurrentFolder() }
                     .keyboardShortcut("r", modifiers: .command)
-                    .disabled(store.selectedFolder == nil)
+                    .disabled(store.selectedFolder == nil || store.isModalPresented)
             }
             CommandGroup(replacing: .printItem) {
                 Button("打印…") { store.requestPrint() }
                     .keyboardShortcut("p", modifiers: .command)
-                    .disabled(store.currentImage == nil)
+                    .disabled(store.currentImage == nil || store.isModalPresented)
             }
             CommandMenu("图片") {
+                // 裸键与方向键在模态面板打开时一律失效,否则会在面板背后改动浏览状态
                 Button("上一张") { store.step(-1) }
                     .keyboardShortcut(.leftArrow, modifiers: [])
-                    .disabled(!store.canStep(-1))
+                    .disabled(!store.canStep(-1) || store.isModalPresented)
                 Button("下一张") { store.step(1) }
                     .keyboardShortcut(.rightArrow, modifiers: [])
-                    .disabled(!store.canStep(1))
+                    .disabled(!store.canStep(1) || store.isModalPresented)
                 Divider()
                 Button("适配窗口") { store.requestZoom(.fit) }
                     .keyboardShortcut("0", modifiers: [])
+                    .disabled(store.currentImage == nil || store.isModalPresented)
                 Button("实际大小") { store.requestZoom(.actualSize) }
                     .keyboardShortcut("1", modifiers: [])
+                    .disabled(store.currentImage == nil || store.isModalPresented)
                 Button("放大") { store.requestZoom(.zoomIn) }
                     .keyboardShortcut("=", modifiers: .command)
+                    .disabled(store.currentImage == nil || store.isModalPresented)
                 Button("缩小") { store.requestZoom(.zoomOut) }
                     .keyboardShortcut("-", modifiers: .command)
+                    .disabled(store.currentImage == nil || store.isModalPresented)
                 Divider()
                 Button("信息面板") { store.showInspector.toggle() }
                     .keyboardShortcut("i", modifiers: [])
+                    .disabled(store.isModalPresented)
                 Button(store.isImmersive ? "退出只看图" : "只看图") {
                     store.toggleImmersive()
                 }
                     .keyboardShortcut("f", modifiers: [])
-                    .disabled(store.currentImage == nil && !store.isImmersive)
+                    .disabled((store.currentImage == nil && !store.isImmersive) || store.isModalPresented)
                 Button("裁切…") { store.requestCrop() }
                     .keyboardShortcut("c", modifiers: [])
-                    .disabled(store.currentImage == nil)
+                    .disabled(store.currentImage == nil || store.isModalPresented)
                 Divider()
                 Button("顺时针旋转 90°") { store.requestRotate() }
                     .keyboardShortcut("r", modifiers: [.command, .option])
-                    .disabled(store.currentImage == nil)
+                    .disabled(store.currentImage == nil || store.isModalPresented)
             }
         }
         Settings {
