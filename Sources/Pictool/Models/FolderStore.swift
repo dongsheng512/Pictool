@@ -113,6 +113,12 @@ final class FolderStore {
             sidebarVisible = false
         } else {
             sidebarVisible = sidebarBeforeImmersive
+            // 退出只看图即结束幻灯片会话(重置状态即可,不用走 endSlideshow 的退出循环)
+            if isSlideshowActive {
+                isSlideshowActive = false
+                isSlideshowPaused = false
+                slideshowGeneration += 1
+            }
         }
     }
 
@@ -128,6 +134,73 @@ final class FolderStore {
     private(set) var rotationCount = 0
     /// 最近一次选图的步进方向:+1 向后,-1 向前,0 点选/无变化
     private(set) var lastStepDirection = 0
+
+    // MARK: 幻灯片播放
+    // 绑定只看图模式:开启即进纯净模式,退出纯净模式即结束会话。
+    // 计时是"单飞链":到点 step(1),step 末尾重新调度,形成链条;
+    // 手动步进/暂停/改间隔都会使 generation 作废旧链,自然实现"手动切图重置计时"。
+
+    /// 幻灯片会话进行中(暂停也算进行中,HUD 仍显示)
+    private(set) var isSlideshowActive = false
+    private(set) var isSlideshowPaused = false
+    /// 播放间隔(偏好;MainContentView 把 @AppStorage 的变更同步进来)
+    var slideshowInterval = SlideShowInterval.load()
+    private var slideshowGeneration = 0
+
+    /// 菜单/HUD 的开关入口:未开启则开始,已开启则在暂停/继续间切换
+    func toggleSlideshow() {
+        if isSlideshowActive {
+            isSlideshowPaused.toggle()
+            if isSlideshowPaused {
+                slideshowGeneration += 1
+            } else {
+                scheduleSlideshowTick()
+            }
+        } else {
+            startSlideshow()
+        }
+    }
+
+    func startSlideshow() {
+        guard currentImage != nil, images.count > 1 else { return }
+        isSlideshowActive = true
+        isSlideshowPaused = false
+        if !isImmersive { toggleImmersive() }
+        scheduleSlideshowTick()
+    }
+
+    /// 结束会话并退出只看图(开启时进的,退出时一并还原)
+    func endSlideshow() {
+        guard isSlideshowActive else { return }
+        isSlideshowActive = false
+        isSlideshowPaused = false
+        slideshowGeneration += 1
+        if isImmersive { toggleImmersive() }
+    }
+
+    /// 播放间隔变更后重排计时(暂停中不排,继续时自然用新值)
+    func slideshowIntervalChanged() {
+        guard isSlideshowActive, !isSlideshowPaused else { return }
+        scheduleSlideshowTick()
+    }
+
+    private func scheduleSlideshowTick() {
+        guard isSlideshowActive, !isSlideshowPaused else { return }
+        slideshowGeneration += 1
+        let gen = slideshowGeneration
+        let seconds = slideshowInterval.seconds
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard let self, gen == self.slideshowGeneration,
+                  self.isSlideshowActive, !self.isSlideshowPaused else { return }
+            // 模态面板(裁切/打印)打开时到点:自动暂停,避免在面板背后切图
+            guard !self.isModalPresented else {
+                self.isSlideshowPaused = true
+                return
+            }
+            self.step(1)
+        }
+    }
 
     func requestRotate() {
         guard currentImage != nil else { return }
@@ -404,18 +477,30 @@ final class FolderStore {
         prefetchNeighbors()
     }
 
-    /// 步进切换;循环由 wrapNavigation 控制
+    /// 步进切换;循环由 wrapNavigation 控制。
+    /// 播放中每次成功步进都会重排计时(计时到点走这里,手动 ←/→ 也走这里,
+    /// 因此手动切图天然重置计时);不循环时到达端点则停在当前张并转为暂停。
     func step(_ delta: Int) {
         guard !images.isEmpty else { return }
         if currentIndex < 0 {
             selectImage(images[0].id, direction: delta)
+            rescheduleSlideshowAfterStep()
             return
         }
         guard let idx = ImageNavigation.nextIndex(
             current: currentIndex, count: images.count, delta: delta, wrap: wrapNavigation
-        ), idx != currentIndex else { return }
+        ), idx != currentIndex else {
+            if isSlideshowActive { isSlideshowPaused = true }
+            return
+        }
         lastStepDirection = delta > 0 ? 1 : (delta < 0 ? -1 : 0)
         selectImage(images[idx].id, direction: lastStepDirection)
+        rescheduleSlideshowAfterStep()
+    }
+
+    private func rescheduleSlideshowAfterStep() {
+        guard isSlideshowActive, !isSlideshowPaused else { return }
+        scheduleSlideshowTick()
     }
 
     func canStep(_ delta: Int) -> Bool {

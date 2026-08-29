@@ -1,7 +1,10 @@
 # Xcode / SwiftPM
 .build/
 .build/*
-build/
+# 打包产物入库:build/PureView.app 作为发布包随仓库分发
+build/*
+!build/PureView.app
+!build/.gitignore
 *.xcodeproj
 xcuserdata/
 .swiftpm/

@@ -9,6 +9,7 @@ struct SettingsView: View {
     @AppStorage(WrapNavigation.storageKey) private var wrapNavigation = WrapNavigation.defaultValue
     @AppStorage(ImageSortKey.storageKey) private var sortKey = ImageSortKey.defaultValue
     @AppStorage(ImageSortDirection.storageKey) private var sortDirection = ImageSortDirection.defaultValue
+    @AppStorage(SlideShowInterval.storageKey) private var slideshowInterval = SlideShowInterval.defaultValue
 
     var body: some View {
         Form {
@@ -42,6 +43,12 @@ struct SettingsView: View {
                 .pickerStyle(.radioGroup)
                 Picker("顺序", selection: $sortDirection) {
                     ForEach(ImageSortDirection.allCases) { option in
+                        Text(option.label).tag(option)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                Picker("幻灯片间隔", selection: $slideshowInterval) {
+                    ForEach(SlideShowInterval.allCases) { option in
                         Text(option.label).tag(option)
                     }
                 }

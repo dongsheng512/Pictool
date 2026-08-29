@@ -121,6 +121,15 @@ struct PictoolApp: App {
                 }
                     .keyboardShortcut("f", modifiers: [])
                     .disabled((store.currentImage == nil && !store.isImmersive) || store.isModalPresented)
+                Button(
+                    store.isSlideshowActive
+                        ? (store.isSlideshowPaused ? "继续幻灯片" : "暂停幻灯片")
+                        : "幻灯片播放"
+                ) {
+                    store.toggleSlideshow()
+                }
+                    .keyboardShortcut(.space, modifiers: [])
+                    .disabled(store.currentImage == nil || store.isModalPresented || store.images.count < 2)
                 Button("裁切…") { store.requestCrop() }
                     .keyboardShortcut("c", modifiers: [])
                     .disabled(store.currentImage == nil || store.isModalPresented)

@@ -153,7 +153,41 @@ enum CropRatio: String, CaseIterable, Identifiable {
     case threeBy4 = "3:4"
     case sixteenBy9 = "16:9"
     case nineBy16 = "9:16"
+    case threeBy2 = "3:2"
+    case fiveBy4 = "5:4"
+    case custom = "自定义"
     var id: String { rawValue }
+
+    /// 目标宽高比(width / height)。自由/原始跟随图片自身比例;
+    /// 自定义由调用方解析输入框给出,解析不出(≤0)时返回 nil,按自由处理。
+    func aspect(imageAspect: CGFloat, customAspect: CGFloat?) -> CGFloat? {
+        switch self {
+        case .free, .original: return imageAspect
+        case .square: return 1
+        case .fourBy3: return 4.0 / 3.0
+        case .threeBy4: return 3.0 / 4.0
+        case .sixteenBy9: return 16.0 / 9.0
+        case .nineBy16: return 9.0 / 16.0
+        case .threeBy2: return 3.0 / 2.0
+        case .fiveBy4: return 5.0 / 4.0
+        case .custom: return customAspect
+        }
+    }
+
+    /// 预设比例能否交换横竖(自由/原始/1:1 无意义)
+    var supportsSwap: Bool {
+        switch self {
+        case .free, .original, .square: return false
+        default: return true
+        }
+    }
+
+    /// 从 "4:3" 这类标签解析出 (w, h);解析不出返回 nil
+    var labelPair: (w: Int, h: Int)? {
+        let parts = rawValue.split(separator: ":")
+        guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) else { return nil }
+        return (w, h)
+    }
 }
 
 enum CropFormat: String, CaseIterable, Identifiable {
@@ -189,6 +223,121 @@ enum CropFormat: String, CaseIterable, Identifiable {
         default: return .png
         }
     }
+
+    /// 扩展名与格式严格对应时返回格式;否则 nil(覆盖原图只允许同格式写回,
+    /// 避免把 .gif 覆盖成 PNG 内容却挂着 .gif 扩展名)
+    static func exactSourceExt(_ ext: String) -> CropFormat? {
+        switch ext.lowercased() {
+        case "png": return .png
+        case "jpg", "jpeg": return .jpeg
+        case "heic": return .heic
+        case "tif", "tiff": return .tiff
+        default: return nil
+        }
+    }
+}
+
+/// 几何变换(纯函数,单测覆盖):四分旋转、翻转、拉直、按最长边降采样。
+/// 全部输出"已经摆正"的位图,选区归一化坐标始终基于变换后的图幅。
+enum CropTransform {
+
+    /// 奇数档旋转会交换宽高(选区所在坐标系的尺寸)
+    static func transformedSize(width: Int, height: Int, quarterTurns: Int) -> CGSize {
+        (((quarterTurns % 2) + 2) % 2 == 1)
+            ? CGSize(width: height, height: width)
+            : CGSize(width: width, height: height)
+    }
+
+    /// 拉直所需的最小放大倍数:旋转 θ 后位图包围盒为 (w·cos+h·sin, w·sin+h·cos),
+    /// 要让原尺寸画框内没有空角,需按包围盒与画框的比值放大。
+    static func coverScale(degrees: Double, width: CGFloat, height: CGFloat) -> CGFloat {
+        let rad = abs(degrees) * .pi / 180
+        guard rad > 0.0001, width > 0, height > 0 else { return 1 }
+        let s = CGFloat(sin(rad)), c = CGFloat(cos(rad))
+        return max((width * c + height * s) / width,
+                   (width * s + height * c) / height)
+    }
+
+    /// 依次应用四分旋转(顺时针为正)→ 翻转 → 拉直。各步独立成图,最多三次绘制,
+    /// 导出全尺寸时也在毫秒级,不值得为省两次拷贝写成单一仿射。
+    static func apply(to image: CGImage, quarterTurns: Int, flipH: Bool, flipV: Bool,
+                      straightenDegrees: Double) -> CGImage {
+        var current = image
+        let turns = ((quarterTurns % 4) + 4) % 4
+        if turns != 0, let rotated = rotateQuarter(current, turns) { current = rotated }
+        if flipH || flipV, let flipped = flipped(current, horizontal: flipH, vertical: flipV) {
+            current = flipped
+        }
+        if abs(straightenDegrees) > 0.0001,
+           let straightened = straightened(current, degrees: straightenDegrees) {
+            current = straightened
+        }
+        return current
+    }
+
+    /// 按最长边降采样;已不超长或参数非法时原样返回
+    static func downscaled(_ image: CGImage, longestSide: Int) -> CGImage {
+        let longest = max(image.width, image.height)
+        guard longestSide > 0, longest > longestSide else { return image }
+        let k = CGFloat(longestSide) / CGFloat(longest)
+        let outW = max(1, Int((CGFloat(image.width) * k).rounded()))
+        let outH = max(1, Int((CGFloat(image.height) * k).rounded()))
+        guard let ctx = makeContext(width: outW, height: outH, colorSpace: image.colorSpace ?? CGColorSpaceCreateDeviceRGB()) else {
+            return image
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+        return ctx.makeImage() ?? image
+    }
+
+    // MARK: 私有
+
+    private static func makeContext(width: Int, height: Int, colorSpace: CGColorSpace) -> CGContext? {
+        CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    }
+
+    /// turns = 顺时针 90° 的次数。方向有像素级单测锁死(左上红块转向验证)。
+    private static func rotateQuarter(_ image: CGImage, _ turns: Int) -> CGImage? {
+        let w = image.width, h = image.height
+        let out = transformedSize(width: w, height: h, quarterTurns: turns)
+        guard let ctx = makeContext(width: Int(out.width), height: Int(out.height),
+                                    colorSpace: image.colorSpace ?? CGColorSpaceCreateDeviceRGB()) else { return nil }
+        switch turns {
+        case 1:  ctx.translateBy(x: out.width, y: 0); ctx.rotate(by: .pi / 2)
+        case 2:  ctx.translateBy(x: out.width, y: out.height); ctx.rotate(by: .pi)
+        case 3:  ctx.translateBy(x: 0, y: out.height); ctx.rotate(by: -.pi / 2)
+        default: break
+        }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    private static func flipped(_ image: CGImage, horizontal: Bool, vertical: Bool) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = makeContext(width: w, height: h,
+                                    colorSpace: image.colorSpace ?? CGColorSpaceCreateDeviceRGB()) else { return nil }
+        ctx.translateBy(x: horizontal ? CGFloat(w) : 0, y: vertical ? CGFloat(h) : 0)
+        ctx.scaleBy(x: horizontal ? -1 : 1, y: vertical ? -1 : 1)
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// 拉直:围绕中心旋转并按 coverScale 放大,输出与输入同尺寸(空角被裁掉)。
+    /// 正角度 = 显示上顺时针(CG 上下文 y 轴向上,渲染时上下翻转,旋转方向随之反转)。
+    private static func straightened(_ image: CGImage, degrees: Double) -> CGImage? {
+        let w = image.width, h = image.height
+        let scale = coverScale(degrees: degrees, width: CGFloat(w), height: CGFloat(h))
+        guard scale > 1, let ctx = makeContext(width: w, height: h,
+                                               colorSpace: image.colorSpace ?? CGColorSpaceCreateDeviceRGB()) else { return nil }
+        ctx.translateBy(x: CGFloat(w) / 2, y: CGFloat(h) / 2)
+        ctx.rotate(by: CGFloat(degrees * .pi / 180))
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.draw(image, in: CGRect(x: -CGFloat(w) / 2, y: -CGFloat(h) / 2,
+                                   width: CGFloat(w), height: CGFloat(h)))
+        return ctx.makeImage()
+    }
 }
 
 enum CropError: LocalizedError {
@@ -204,24 +353,36 @@ enum CropError: LocalizedError {
 /// 裁切 + 编码导出(尽量保留原 EXIF;方向已在解码时摆正,导出时重置 orientation)
 enum CropService {
 
-    /// 返回编码后的图片数据,由调用方负责保存面板与写盘
+    /// 返回编码后的图片数据,由调用方负责保存面板与写盘。
+    /// 管线:解码全尺寸 → 变换(旋转/翻转/拉直)→ 按归一化选区裁切 → 可选降采样 → 编码。
+    /// 选区归一化坐标基于变换后的图幅,与预览一致。
     static func encode(sourceURL: URL,
                        normalizedRect: CGRect,
                        format: CropFormat,
-                       quality: Double) throws -> Data {
-        let facts = ImageLoader.facts(of: sourceURL)
-        let pixelSize = CGSize(width: facts.pixelWidth, height: facts.pixelHeight)
-        guard pixelSize.width > 1, pixelSize.height > 1 else { throw CropError.decodeFailed }
-
-        let rect = CropMath.pixelRect(normalized: normalizedRect, pixelSize: pixelSize)
+                       quality: Double,
+                       quarterTurns: Int = 0,
+                       flipH: Bool = false,
+                       flipV: Bool = false,
+                       straightenDegrees: Double = 0,
+                       maxLongestSide: Int? = nil,
+                       includeGPS: Bool = true) throws -> Data {
         let full = try ImageLoader.decodeFullCGImage(url: sourceURL)
-        guard let cropped = full.cropping(to: rect), rect.width > 0, rect.height > 0 else {
+        let transformed = CropTransform.apply(
+            to: full, quarterTurns: quarterTurns, flipH: flipH, flipV: flipV,
+            straightenDegrees: straightenDegrees
+        )
+        let rect = CropMath.pixelRect(
+            normalized: normalizedRect,
+            pixelSize: CGSize(width: transformed.width, height: transformed.height)
+        )
+        guard let cropped = transformed.cropping(to: rect), rect.width > 0, rect.height > 0 else {
             throw CropError.decodeFailed
         }
+        let output = CropTransform.downscaled(cropped, longestSide: maxLongestSide ?? 0)
 
-        let output = NSMutableData()
+        let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
-            output, format.uti as CFString, 1, nil
+            data, format.uti as CFString, 1, nil
         ) else { throw CropError.encodeFailed }
 
         var properties: [CFString: Any] = [:]
@@ -229,16 +390,18 @@ enum CropService {
         if format.isLossy {
             properties[kCGImageDestinationLossyCompressionQuality] = quality
         }
-        // 携带原 EXIF / GPS(无方向语义的部分)
+        // 携带原 EXIF / IPTC;GPS 按隐私开关决定是否带出
         if let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
-            for key in [kCGImagePropertyExifDictionary, kCGImagePropertyGPSDictionary,
-                        kCGImagePropertyIPTCDictionary] {
+            for key in [kCGImagePropertyExifDictionary, kCGImagePropertyIPTCDictionary] {
                 if let value = props[key] { properties[key] = value }
             }
+            if includeGPS, let gps = props[kCGImagePropertyGPSDictionary] {
+                properties[kCGImagePropertyGPSDictionary] = gps
+            }
         }
-        CGImageDestinationAddImage(dest, cropped, properties as CFDictionary)
+        CGImageDestinationAddImage(dest, output, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw CropError.encodeFailed }
-        return output as Data
+        return data as Data
     }
 }

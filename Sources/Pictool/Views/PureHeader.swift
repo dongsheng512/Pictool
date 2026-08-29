@@ -126,6 +126,13 @@ struct PureHeader: View {
             HeaderButton("info.circle", help: "图片信息 (I)") {
                 store.showInspector.toggle()
             }
+            HeaderButton(
+                store.isSlideshowActive && !store.isSlideshowPaused ? "pause.circle" : "play.circle",
+                help: store.isSlideshowActive && !store.isSlideshowPaused
+                    ? "暂停幻灯片 (空格)"
+                    : "幻灯片播放 (空格)",
+                disabled: store.currentImage == nil || store.images.count < 2
+            ) { store.toggleSlideshow() }
             HeaderDivider()
             HeaderButton(
                 store.isImmersive ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",

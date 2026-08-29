@@ -22,6 +22,13 @@ struct MainContentView: View {
     @AppStorage(WrapNavigation.storageKey) private var wrapNavigation = WrapNavigation.defaultValue
     @AppStorage(ImageSortKey.storageKey) private var sortKey = ImageSortKey.defaultValue
     @AppStorage(ImageSortDirection.storageKey) private var sortDirection = ImageSortDirection.defaultValue
+    @AppStorage(SlideShowInterval.storageKey) private var slideshowInterval = SlideShowInterval.defaultValue
+    // 幻灯片 HUD:鼠标移动浮现,静止 2.5 秒淡出;悬停在 HUD 上时保持
+    @State private var slideshowHUDVisible = false
+    @State private var isHoveringSlideshowHUD = false
+    @State private var slideshowHoverGeneration = 0
+    @State private var lastHoverLocation: CGPoint?
+    @State private var slideshowHoverMonitor: Any?
 
     private var sortPreference: ImageSortPreference {
         ImageSortPreference(key: sortKey, direction: sortDirection)
@@ -43,7 +50,23 @@ struct MainContentView: View {
             runZoomSelfTestIfRequested()
             dragStartWidth = sidebarWidth
             store.wrapNavigation = wrapNavigation
+            store.slideshowInterval = slideshowInterval
             store.applySortPreference(sortPreference)
+        }
+        .onChange(of: slideshowInterval) { _, value in
+            store.slideshowInterval = value
+            store.slideshowIntervalChanged()
+        }
+        .onChange(of: store.isImmersive) { _, immersive in
+            // 纯净模式全程挂本地事件监视器:鼠标移到底部热区即浮现幻灯片 HUD,
+            // 不必先开启播放(播放按钮在 HUD 里,可直接开播)
+            updateSlideshowHoverMonitor(active: immersive)
+            if !immersive {
+                withAnimation(.easeInOut(duration: 0.2)) { slideshowHUDVisible = false }
+            }
+        }
+        .onChange(of: store.isSlideshowActive) { _, active in
+            if active { showSlideshowHUD() }
         }
         .onChange(of: wrapNavigation) { _, value in
             store.wrapNavigation = value
@@ -118,7 +141,69 @@ struct MainContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .bottom) {
+            if slideshowHUDVisible {
+                SlideshowHUD(
+                    playing: store.isSlideshowActive && !store.isSlideshowPaused,
+                    canPlay: store.images.count >= 2 && store.currentImage != nil,
+                    positionText: "\(max(store.currentIndex, 0) + 1) / \(store.images.count)",
+                    intervalLabel: store.slideshowInterval.label,
+                    onPrev: { store.step(-1) },
+                    onToggle: { store.toggleSlideshow() },
+                    onNext: { store.step(1) },
+                    onCycleInterval: { slideshowInterval = store.slideshowInterval.next },
+                    onExit: { store.isSlideshowActive ? store.endSlideshow() : store.toggleImmersive() }
+                )
+                .onHover { hovering in
+                    isHoveringSlideshowHUD = hovering
+                    // 进入 HUD 时 showSlideshowHUD 里的 generation 作废旧计时,
+                    // 离开时重新起一个淡出计时,HUD 保持可见
+                    if hovering { showSlideshowHUD() }
+                }
+                .transition(.opacity)
+                .padding(.bottom, 24)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: slideshowHUDVisible)
         .ignoresSafeArea()
+    }
+
+    // MARK: 幻灯片 HUD 显隐(本地事件监视器,不受画布 NSView 吞掉 mouseMoved 影响)
+
+    private func showSlideshowHUD() {
+        slideshowHoverGeneration += 1
+        let gen = slideshowHoverGeneration
+        withAnimation(.easeInOut(duration: 0.2)) { slideshowHUDVisible = true }
+        Task {
+            try? await Task.sleep(for: .seconds(2.5))
+            guard gen == slideshowHoverGeneration, !isHoveringSlideshowHUD else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { slideshowHUDVisible = false }
+        }
+    }
+
+    private func updateSlideshowHoverMonitor(active: Bool) {
+        if active, slideshowHoverMonitor == nil {
+            slideshowHoverMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { event in
+                noteSlideshowActivity()
+                return event
+            }
+        } else if !active, let monitor = slideshowHoverMonitor {
+            NSEvent.removeMonitor(monitor)
+            slideshowHoverMonitor = nil
+            lastHoverLocation = nil
+        }
+    }
+
+    private func noteSlideshowActivity() {
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        let mouse = NSEvent.mouseLocation
+        let frame = window.frame
+        // 底部 160pt 热区:鼠标进入才浮现 HUD,在其他区域移动不打扰
+        guard mouse.y - frame.minY < 160 else { return }
+        if let last = lastHoverLocation,
+           abs(mouse.x - last.x) < 6, abs(mouse.y - last.y) < 6 { return }
+        lastHoverLocation = mouse
+        showSlideshowHUD()
     }
 
     private var normalLayer: some View {
@@ -165,7 +250,8 @@ struct MainContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .sheet(isPresented: $showCropSheet) {
                         if let file = store.currentImage {
-                            CropView(file: file, isDisplayRotated: store.isDisplayRotated)
+                            // 裁切带入主视图当前的显示旋转,进裁切不再丢角度
+                            CropView(file: file, initialQuarterTurns: ((store.rotationCount % 4) + 4) % 4)
                         }
                     }
                     .onChange(of: store.cropRequestToken) { _, _ in
@@ -626,6 +712,63 @@ struct MainContentView: View {
         }
         // 兜底：若拖入的是目录集合，打开首个
         if let firstDir = dirs.first { store.openFolder(firstDir) }
+    }
+}
+
+/// 幻灯片播放 HUD:底部居中胶囊条,播放/暂停、前后切换、间隔循环、退出。
+/// 纯净模式下鼠标移到底部即浮现,未开播时也可直接在这里点播放。
+private struct SlideshowHUD: View {
+    let playing: Bool
+    var canPlay: Bool = true
+    let positionText: String
+    let intervalLabel: String
+    let onPrev: () -> Void
+    let onToggle: () -> Void
+    let onNext: () -> Void
+    let onCycleInterval: () -> Void
+    let onExit: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(positionText)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Divider().frame(height: 16)
+            hudButton("chevron.left", action: onPrev)
+            hudButton(playing ? "pause.fill" : "play.fill", action: onToggle, prominent: true, disabled: !canPlay)
+            hudButton("chevron.right", action: onNext)
+            Divider().frame(height: 16)
+            Button(action: onCycleInterval) {
+                Text(intervalLabel)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 34)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("播放间隔(点击切换)")
+            Divider().frame(height: 16)
+            hudButton("xmark", action: onExit)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.separator))
+    }
+
+    private func hudButton(_ symbol: String, action: @escaping () -> Void, prominent: Bool = false, disabled: Bool = false) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: prominent ? 14 : 12, weight: .medium))
+                .foregroundStyle(prominent ? Color.primary : Color.secondary)
+                .frame(width: 26, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.35 : 1)
     }
 }
 

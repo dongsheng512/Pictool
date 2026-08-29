@@ -77,6 +77,33 @@ enum WrapNavigation {
     static let defaultValue = true
 }
 
+/// 幻灯片播放间隔(秒)。间隔下限 1 秒,防止大图解码慢时永远在转圈。
+enum SlideShowInterval: Int, CaseIterable, Identifiable {
+    case s1 = 1
+    case s2 = 2
+    case s3 = 3
+    case s5 = 5
+    case s10 = 10
+
+    static let storageKey = "slideshowInterval"
+    static let defaultValue = SlideShowInterval.s2
+
+    var id: Int { rawValue }
+    var seconds: Int { rawValue }
+    var label: String { "\(rawValue) 秒" }
+
+    /// 下一档(HUD 上循环切换用)
+    var next: SlideShowInterval {
+        let all = SlideShowInterval.allCases
+        let idx = all.firstIndex(of: self) ?? 0
+        return all[(idx + 1) % all.count]
+    }
+
+    static func load(from defaults: UserDefaults = .standard) -> SlideShowInterval {
+        SlideShowInterval(rawValue: defaults.integer(forKey: storageKey)) ?? defaultValue
+    }
+}
+
 /// 侧栏正上方那一段(红绿灯所在列)的配色
 enum SidebarTopStyle: String, CaseIterable, Identifiable {
     /// 与侧栏同色,整列通到窗口顶,和主区顶栏分开

@@ -183,6 +183,141 @@ final class ImageNavigationTests: XCTestCase {
     }
 }
 
+final class CropTransformTests: XCTestCase {
+
+    /// 2×1 图:左半红、右半蓝(CG 上下文 y 向上,但列位置与显示一致)
+    private func makeLeftRedRightBlue() throws -> CGImage {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 2, height: 1, bitsPerComponent: 8,
+                                          bytesPerRow: 8, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        ctx.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 1, y: 0, width: 1, height: 1))
+        return try XCTUnwrap(ctx.makeImage())
+    }
+
+    /// 读取显示坐标系下的像素(行 0 = 显示顶部)
+    private func pixel(at image: CGImage, x: Int, y: Int) throws -> (r: UInt8, g: UInt8, b: UInt8) {
+        let w = image.width, h = image.height
+        var buffer = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = try XCTUnwrap(CGContext(
+            data: &buffer, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        // CG 上下文 y 向上:显示行 y 对应上下文行 h-1-y
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let row = h - 1 - y
+        let offset = (row * w + x) * 4
+        return (buffer[offset], buffer[offset + 1], buffer[offset + 2])
+    }
+
+    func testTransformedSizeSwapsOnOddTurns() {
+        XCTAssertEqual(CropTransform.transformedSize(width: 40, height: 20, quarterTurns: 0),
+                       CGSize(width: 40, height: 20))
+        XCTAssertEqual(CropTransform.transformedSize(width: 40, height: 20, quarterTurns: 1),
+                       CGSize(width: 20, height: 40))
+        XCTAssertEqual(CropTransform.transformedSize(width: 40, height: 20, quarterTurns: 3),
+                       CGSize(width: 20, height: 40))
+        XCTAssertEqual(CropTransform.transformedSize(width: 40, height: 20, quarterTurns: 4),
+                       CGSize(width: 40, height: 20))
+    }
+
+    func testRotateClockwiseMovesLeftPixelToTop() throws {
+        let image = try makeLeftRedRightBlue()
+        // 顺时针 90°:左列(红)转到顶部
+        let rotated = CropTransform.apply(to: image, quarterTurns: 1, flipH: false, flipV: false,
+                                          straightenDegrees: 0)
+        XCTAssertEqual(rotated.width, 1)
+        XCTAssertEqual(rotated.height, 2)
+        let top = try pixel(at: rotated, x: 0, y: 0)
+        let bottom = try pixel(at: rotated, x: 0, y: 1)
+        XCTAssertGreaterThan(top.r, 200, "顺时针旋转后顶部应是红色")
+        XCTAssertLessThan(top.b, 50)
+        XCTAssertGreaterThan(bottom.b, 200, "顺时针旋转后底部应是蓝色")
+    }
+
+    func testRotateCounterclockwiseMovesLeftPixelToBottom() throws {
+        let image = try makeLeftRedRightBlue()
+        let rotated = CropTransform.apply(to: image, quarterTurns: 3, flipH: false, flipV: false,
+                                          straightenDegrees: 0)
+        XCTAssertEqual(rotated.width, 1)
+        let bottom = try pixel(at: rotated, x: 0, y: 1)
+        XCTAssertGreaterThan(bottom.r, 200, "逆时针旋转后底部应是红色")
+    }
+
+    func testFlipHorizontalMirrorsColumns() throws {
+        let image = try makeLeftRedRightBlue()
+        let flipped = CropTransform.apply(to: image, quarterTurns: 0, flipH: true, flipV: false,
+                                          straightenDegrees: 0)
+        let left = try pixel(at: flipped, x: 0, y: 0)
+        let right = try pixel(at: flipped, x: 1, y: 0)
+        XCTAssertGreaterThan(left.b, 200, "水平翻转后左侧应是蓝色")
+        XCTAssertGreaterThan(right.r, 200, "水平翻转后右侧应是红色")
+    }
+
+    func testApplyIdentityReturnsSameSize() throws {
+        let image = try makeLeftRedRightBlue()
+        let same = CropTransform.apply(to: image, quarterTurns: 0, flipH: false, flipV: false,
+                                       straightenDegrees: 0)
+        XCTAssertEqual(same.width, 2)
+        XCTAssertEqual(same.height, 1)
+    }
+
+    func testCoverScaleBasics() {
+        XCTAssertEqual(CropTransform.coverScale(degrees: 0, width: 100, height: 100), 1)
+        // 正方形转 45°:需要放大 √2 才没有空角
+        XCTAssertEqual(CropTransform.coverScale(degrees: 45, width: 100, height: 100),
+                       sqrt(2), accuracy: 0.001)
+        // 2:1 转 45°:受短边公式支配 (2sin+cos)/1
+        XCTAssertEqual(CropTransform.coverScale(degrees: 45, width: 200, height: 100),
+                       2 * sin(.pi / 4) + cos(.pi / 4), accuracy: 0.001)
+    }
+
+    func testDownscaleLimitsLongestSide() throws {
+        let image = try makeLeftRedRightBlue()
+        let small = CropTransform.downscaled(image, longestSide: 1)
+        XCTAssertEqual(max(small.width, small.height), 1)
+        // 已短于目标时原样返回
+        let untouched = CropTransform.downscaled(small, longestSide: 100)
+        XCTAssertEqual(untouched.width, small.width)
+        XCTAssertEqual(untouched.height, small.height)
+    }
+}
+
+final class SlideShowIntervalTests: XCTestCase {
+
+    private func makeDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "SlideShowIntervalTests-\(UUID().uuidString)")!
+    }
+
+    func testLoadDefaultsWhenMissing() {
+        let d = makeDefaults()
+        XCTAssertEqual(SlideShowInterval.load(from: d), .s2)
+    }
+
+    func testLoadRoundtrip() {
+        let d = makeDefaults()
+        d.set(10, forKey: SlideShowInterval.storageKey)
+        XCTAssertEqual(SlideShowInterval.load(from: d), .s10)
+        XCTAssertEqual(SlideShowInterval.s10.seconds, 10)
+    }
+
+    func testLoadRejectsInvalidRawValue() {
+        let d = makeDefaults()
+        d.set(7, forKey: SlideShowInterval.storageKey)
+        XCTAssertEqual(SlideShowInterval.load(from: d), .s2)
+    }
+
+    func testNextCyclesThroughAllCases() {
+        let all = SlideShowInterval.allCases
+        for (i, interval) in all.enumerated() {
+            XCTAssertEqual(interval.next, all[(i + 1) % all.count])
+        }
+    }
+}
+
 final class MetadataFormatTests: XCTestCase {
 
     func testFormatNames() {

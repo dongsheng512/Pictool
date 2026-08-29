@@ -1,0 +1,4 @@
+*
+!PureView.app
+!PureView.app/**
+!.gitignore
