@@ -14,7 +14,9 @@ struct ImageViewCanvas: NSViewRepresentable {
     /// 打开新图时的默认缩放
     let openZoomMode: OpenZoomMode
     let zoomRequest: (action: ZoomAction, token: Int)?
-    let rotateRequestToken: Int
+    /// 当前图累计旋转次数(每格 90°)。画布按「次数 - 已应用」补差值,
+    /// 新建的画布实例(纯净模式切换)能重放完整角度。
+    let rotationCount: Int
     /// 切图方向信号:+1 向后翻(新图从右滑入),-1 向前,0 无方向(淡入)
     let stepDirection: Int
     var onLoadingChange: (Bool) -> Void
@@ -23,6 +25,9 @@ struct ImageViewCanvas: NSViewRepresentable {
     /// 当前显示位图是否已被用户旋转。旋转是纯显示态,切图即丢,需要让界面如实告知。
     var onRotationChange: (Bool) -> Void
     var onStep: (Int) -> Void
+    /// 信息面板开合动画期间为真:冻结布局重排,避免 fit 每帧重算导致图片连续形变;
+    /// 解除时补一次布局。纯净模式无面板,恒为 false。
+    var relayoutSuppressed: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -35,13 +40,24 @@ struct ImageViewCanvas: NSViewRepresentable {
         coordinator.parent = self
         coordinator.applyFile(file)
         coordinator.applyBackground(background)
+        coordinator.setRelayoutSuppressed(relayoutSuppressed)
         if let request = zoomRequest, request.token != coordinator.appliedZoomToken {
             coordinator.appliedZoomToken = request.token
             coordinator.performZoom(request.action)
         }
-        if rotateRequestToken != coordinator.appliedRotateToken {
-            coordinator.appliedRotateToken = rotateRequestToken
-            coordinator.performRotate()
+        // 补齐旋转差值:新建画布(纯净模式切换)从 0 起,能把累计角度完整重放。
+        // 图片尚未就绪时 performRotate 会跳过,差额留在 appliedRotationCount 上,
+        // 待图片就绪触发的下一次 UI 更新再补。
+        let pendingRotations = rotationCount - coordinator.appliedRotationCount
+        if pendingRotations > 0 {
+            var applied = 0
+            for _ in 0..<pendingRotations {
+                guard coordinator.performRotate() else { break }
+                applied += 1
+            }
+            coordinator.appliedRotationCount += applied
+        } else if pendingRotations < 0 {
+            coordinator.appliedRotationCount = rotationCount
         }
     }
 
@@ -59,14 +75,28 @@ struct ImageViewCanvas: NSViewRepresentable {
         private var loadTask: Task<Void, Never>?
         private var animationTask: Task<Void, Never>?
         var appliedZoomToken = 0
-        var appliedRotateToken = 0
+        var appliedRotationCount = 0
         private let zoomDebug = ProcessInfo.processInfo.arguments.contains("--zoom-debug")
+
+        /// --zoom-debug 时同步落一份到固定文件,便于从 Finder 启动的实例抓日志
+        private static let debugLogFile: FileHandle? = {
+            guard ProcessInfo.processInfo.arguments.contains("--zoom-debug") else { return nil }
+            let path = "/tmp/pictool_zoom.log"
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(atPath: path, contents: nil)
+            }
+            return FileHandle(forWritingAtPath: path)
+        }()
 
         private func debugLog(_ tag: String) {
             guard zoomDebug else { return }
             let b = clipView.bounds
-            print("[zoom] \(tag) scale=\(scale) fitScale=\(fitScale) wasFit=\(wasFit) origin=(\(b.origin.x), \(b.origin.y)) frame=\(imageView.frame) clip=(\(b.width), \(b.height)) mag=\(scrollView.magnification)")
+            let line = "[zoom] \(tag) scale=\(scale) fitScale=\(fitScale) wasFit=\(wasFit) origin=(\(b.origin.x), \(b.origin.y)) frame=\(imageView.frame) clip=(\(b.width), \(b.height)) mag=\(scrollView.magnification)"
+            print(line)
             fflush(stdout)
+            if let fh = Self.debugLogFile {
+                fh.write(Data((line + "\n").utf8))
+            }
         }
 
         /// 延迟复查:捕获"事后被改回"的延迟性回退
@@ -80,6 +110,8 @@ struct ImageViewCanvas: NSViewRepresentable {
         private var fitScale: CGFloat = 1
         private var wasFit = true
         private var isFullResolution = false
+        /// 解码完成但缩放动画未结束的换图操作,动画收尾时执行
+        private var pendingEscalateApply: (() -> Void)?
         /// 当前图的帧数;动图不参与全尺寸升级(没有更高分辨率,升级只会打断播放)
         private var frameCount = 1
         private var escalating = false
@@ -125,9 +157,12 @@ struct ImageViewCanvas: NSViewRepresentable {
             clipView.onZoomDelta = { [weak self] delta, anchor in
                 self?.smoothZoom(multiplyingBy: 1 + delta, anchor: anchor, duration: 0.18)
             }
-            scrollView.onMagnifyDelta = { [weak self] delta, anchor in
-                // 捏合跟手要短,否则会拖在手指后面
-                self?.smoothZoom(multiplyingBy: 1 + delta, anchor: anchor, duration: 0.08)
+            scrollView.onMagnifyDelta = { [weak self] delta, _ in
+                // 捏合以视口中心为锚点:macOS magnify 事件的位置是闲置的鼠标指针
+                // 而不是手指,围绕它放大会让画面随指针停放位置越放越偏。
+                // 「指哪放大哪」的需求由 ⌘/⌥+滚轮承担(仍以光标为锚点)。
+                guard let self else { return }
+                self.smoothZoom(multiplyingBy: 1 + delta, anchor: self.visibleCenter(), duration: 0.08)
             }
             scrollView.onSmartZoom = { [weak self] in
                 guard let self else { return }
@@ -205,12 +240,73 @@ struct ImageViewCanvas: NSViewRepresentable {
                     self.lateCheck("afterSimPinch")
                 }
             }
+            // 漂移实验:模拟真实捏合路径(连续小步长 smoothZoom,固定锚点),
+            // 记录逐 tick 的 origin 与「锚点内容点固定」理论值的偏差。
+            // 严格串行:每步动画结束后才触发下一步,避免步间合并导致测量失真。
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name("PictoolSimAnchorPinch"), object: nil, queue: .main
+            ) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let u = note.userInfo ?? [:]
+                    let ax = (u["ax"] as? Double) ?? 0.5
+                    let ay = (u["ay"] as? Double) ?? 0.5
+                    let steps = (u["steps"] as? Int) ?? 60
+                    let factor = (u["factor"] as? Double) ?? 1.025
+                    let clip = self.clipView.bounds
+                    let anchor = CGPoint(x: clip.width * CGFloat(ax), y: clip.height * CGFloat(ay))
+                    let startOrigin = self.clipView.bounds.origin
+                    let startDoc = self.imageView.frame.size
+                    let anchorDoc0 = CGPoint(x: anchor.x + startOrigin.x, y: anchor.y + startOrigin.y)
+                    var recordedDoc = startDoc
+                    var step = 0
+                    FileHandle.standardError.write(Data(
+                        "[drift] begin anchor=(\(anchor.x),\(anchor.y)) origin=\(startOrigin) doc=\(startDoc)\n".utf8))
+                    @MainActor func runStep() {
+                        self.smoothZoom(multiplyingBy: CGFloat(factor), anchor: anchor, duration: 0.02)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                            MainActor.assumeIsolated {
+                                step += 1
+                                let o = self.clipView.bounds.origin
+                                let d = self.imageView.frame.size
+                                // 理论 origin:锚点内容点自实验开始保持不动
+                                let totalRatio = d.width / startDoc.width
+                                let ideal = CGPoint(x: anchorDoc0.x * totalRatio - anchor.x,
+                                                    y: anchorDoc0.y * totalRatio - anchor.y)
+                                let errX = o.x - ideal.x
+                                let errY = o.y - ideal.y
+                                recordedDoc = d
+                                if step % 10 == 0 || abs(errX) > 1 || abs(errY) > 1 {
+                                    FileHandle.standardError.write(Data(
+                                        "[drift] step=\(step) origin=(\(o.x),\(o.y)) ideal=(\(ideal.x),\(ideal.y)) err=(\(errX),\(errY)) doc=\(d.width)\n".utf8))
+                                }
+                                if step < steps {
+                                    runStep()
+                                } else {
+                                    FileHandle.standardError.write(Data(
+                                        "[drift] END origin=\(o) totalErr=(\(errX),\(errY)) zoom=\(d.width/startDoc.width)\n".utf8))
+                                }
+                            }
+                        }
+                    }
+                    runStep()
+                }
+            }
 #endif
         }
 
         /// 已应用的背景。updateNSView 每次 SwiftUI 重渲染都会跑,
         /// 不判等的话 clipView 的 didSet 会让画布每帧全量重绘(平滑缩放时尤其明显)。
         private var appliedBackground: CanvasBackground?
+
+        /// 布局冻结(信息面板开合动画期间)。解除瞬间补一次布局:
+        /// 此时面板宽度已到位,fit/夹取按最终尺寸一步到位,而不是动画期间每帧重算。
+        private var relayoutSuppressed = false
+        func setRelayoutSuppressed(_ suppressed: Bool) {
+            guard suppressed != relayoutSuppressed else { return }
+            relayoutSuppressed = suppressed
+            if !suppressed { handleLayout() }
+        }
 
         /// 应用画布背景;图片层保持透明以便 PNG 透出背景
         func applyBackground(_ background: CanvasBackground) {
@@ -235,6 +331,7 @@ struct ImageViewCanvas: NSViewRepresentable {
             loadTask?.cancel()
             escalateWork?.cancel()
             escalating = false
+            pendingEscalateApply = nil   // 换图后旧图的全尺寸换入作废
             scrollView.magnification = 1   // 切换图片时重置手势缩放
 
             guard let url else {
@@ -332,6 +429,7 @@ struct ImageViewCanvas: NSViewRepresentable {
             truePixelSize = CGSize(width: facts.pixelWidth, height: facts.pixelHeight)
             bitmapPixelSize = truePixelSize
             isRotatedBitmap = false
+            appliedRotationCount = 0   // 新图从 0 角度起,store 侧计数也已归零
             frameCount = max(1, facts.frameCount)
             parent.onRotationChange(false)   // 新图从文件解码,不继承上一张的旋转
             parent.onImageInfo(DisplayImageInfo(
@@ -407,6 +505,7 @@ struct ImageViewCanvas: NSViewRepresentable {
         }
 
         private func handleLayout() {
+            guard !relayoutSuppressed else { return }
             guard !mutatingCanvas, imageView.image != nil else { return }
             // 捏合手势进行中(bounds 尺寸被 magnification 改变),不干预布局
             guard abs(scrollView.magnification - 1) < 0.001 else { return }
@@ -561,8 +660,11 @@ struct ImageViewCanvas: NSViewRepresentable {
             wasFit = false
             let b = clipView.bounds
             var pt = anchor ?? visibleCenter()
-            pt.x = min(max(pt.x, b.minX), b.maxX)
-            pt.y = min(max(pt.y, b.minY), b.maxY)
+            // 锚点是 clip 本地坐标(0..size)。夹取必须按尺寸,不能用 bounds.minX/maxX——
+            // 那是文档坐标(含滚动 origin),深缩放时 origin 超过锚点后会把锚点
+            // 强行抬到 origin 上,缩放就围绕视口角落转,画面整体向右上漂移。
+            pt.x = min(max(pt.x, 0), b.width)
+            pt.y = min(max(pt.y, 0), b.height)
             let base = zoomTarget ?? scale
             startSmoothZoom(to: base * factor, anchor: pt, duration: duration)
         }
@@ -618,6 +720,11 @@ struct ImageViewCanvas: NSViewRepresentable {
                 applyScale(target, anchor: zoomAnchorPoint, settling: true)
                 cancelSmoothZoom()
                 if asFit { wasFit = true }
+                // 动画收尾:执行等待中的全尺寸换图(等尺寸、中心保持,视觉无感)
+                if let apply = pendingEscalateApply {
+                    pendingEscalateApply = nil
+                    apply()
+                }
             } else {
                 applyScale(next, anchor: zoomAnchorPoint, settling: false)
             }
@@ -628,10 +735,22 @@ struct ImageViewCanvas: NSViewRepresentable {
         private final class ZoomTickProxy: NSObject {
             weak var coordinator: Coordinator?
             weak var link: CADisplayLink?
+            var lastTick: CFTimeInterval = 0
             @objc func tick(_ sender: CADisplayLink) {
                 guard let coordinator else {
                     link?.invalidate()
                     return
+                }
+                // 临时性能测量:--zoom-debug 下打印帧间隔,定位卡顿
+                if coordinator.zoomDebug {
+                    let now = CACurrentMediaTime()
+                    if lastTick > 0 {
+                        let delta = (now - lastTick) * 1000
+                        if delta > 25 {   // 正常 60-120fps 是 8-17ms,超过 25ms 记为掉帧
+                            FileHandle.standardError.write(Data("[perf] tick gap \(Int(delta))ms\n".utf8))
+                        }
+                    }
+                    lastTick = now
                 }
                 coordinator.zoomTick()
             }
@@ -705,13 +824,12 @@ struct ImageViewCanvas: NSViewRepresentable {
         }
 
         /// 百分比语义:每个图像源像素对应多少屏幕物理像素。
-        /// 由几何直接推导(frame 点数 × backing ÷ 当前位图像素宽),
-        /// 与当前加载的表示(降采样或全尺寸)无关——否则大图降采样浏览时读数偏低,
-        /// 且升级到全尺寸瞬间同一画面会跳变。DPI 标注的文件按真实像素如实呈现。
+        /// 必须除以源图像素(truePixelSize)而不是当前位图——否则升级换图的瞬间
+        /// 位图变宽、同一画面读数会腰斩(90%→45%)。DPI 标注的文件按真实像素如实呈现。
         private func effectiveScale(backing: CGFloat) -> CGFloat {
             let frameWidth = imageView.frame.width
-            if frameWidth > 0, bitmapPixelSize.width > 0 {
-                return frameWidth * backing * scrollView.magnification / bitmapPixelSize.width
+            if frameWidth > 0, truePixelSize.width > 0 {
+                return frameWidth * backing * scrollView.magnification / truePixelSize.width
             }
             return scale * scrollView.magnification
         }
@@ -749,6 +867,8 @@ struct ImageViewCanvas: NSViewRepresentable {
             // 4000px 的图以 2800px 位图显示到 4000 设备像素,判定 4000 > 4200 为假,永远不升级。
             // 系数 0.9 让全尺寸在到达 100% 之前就位。
             if displayedPx > CGFloat(rep.pixelsWide) * 0.9 {
+                // 已有待执行的换图(等动画结束)时不重复触发
+                guard pendingEscalateApply == nil else { return }
                 escalate {}
             }
         }
@@ -771,32 +891,58 @@ struct ImageViewCanvas: NSViewRepresentable {
                 }
                 guard !Task.isCancelled, self.currentURL == url, let full,
                       full.size.width > 0 else { return }
-                // 以解码完成时的实时视觉尺寸换算:
-                // 加载期间用户的缩放/平移不能被解码开始前的快照覆盖(延迟回跳的根源)
-                let visual = self.imageView.frame.size
-                let origin = self.clipView.bounds.origin
-                guard visual.width > 0 else { return }
-                let newScale = min(max(visual.width / full.size.width, self.minScale), 64)
-                let newSize = CGSize(width: full.size.width * newScale, height: full.size.height * newScale)
-                let kept = ZoomMath.originKeepingVisibleCenter(
-                    oldOrigin: origin,
-                    oldDoc: visual,
-                    newDoc: newSize,
-                    clipSize: self.clipView.bounds.size
-                )
-                self.commitCanvasChange {
-                    self.imageView.image = full
-                    self.bitmapPixelSize = CGSize(
-                        width: full.representations.first?.pixelsWide ?? Int(full.size.width),
-                        height: full.representations.first?.pixelsHigh ?? Int(full.size.height)
-                    )
-                    self.isFullResolution = true
-                    self.scale = newScale
-                    self.applyDocument(size: newSize, origin: kept, snap: true)
-                    self.fitScale = self.fitScaleValue()
+                // 缩放动画进行中:推迟到动画结束再换图,手势全程零不连续。
+                // (换图本身视觉无感,但叠在手势中途的任何时序误差都会被感知为"漂移")
+                if self.zoomTarget != nil {
+                    self.pendingEscalateApply = { [weak self] in
+                        self?.applyEscalatedImage(full, url: url)
+                    }
+                } else {
+                    self.applyEscalatedImage(full, url: url)
                 }
-                self.notifyScale()
             }
+        }
+
+        /// 把解码完成的全尺寸位图换入画布(等尺寸、视口中心保持,视觉无感)。
+        /// 调用时机:不在平滑缩放动画中途。
+        private func applyEscalatedImage(_ full: NSImage, url: URL) {
+            guard currentURL == url, !isRotatedBitmap,
+                  full.size.width > 0 else { return }
+            // 以解码完成时的实时视觉尺寸换算:
+            // 加载期间用户的缩放/平移不能被解码开始前的快照覆盖(延迟回跳的根源)
+            let visual = imageView.frame.size
+            let origin = clipView.bounds.origin
+            guard visual.width > 0 else { return }
+            let newScale = min(max(visual.width / full.size.width, minScale), 64)
+            let newSize = CGSize(width: full.size.width * newScale, height: full.size.height * newScale)
+            let kept = ZoomMath.originKeepingVisibleCenter(
+                oldOrigin: origin,
+                oldDoc: visual,
+                newDoc: newSize,
+                clipSize: clipView.bounds.size
+            )
+            // scale 的单位是"占 NSImage 点尺寸的比例",位图从降采样换成全尺寸后单位变了。
+            // 进行中的平滑缩放(zoomTarget/zoomStart)必须同步换算到新单位,否则动画会
+            // 套用旧目标导致画面瞬间跳大/缩放读数闪跳——缩放跨过升级阈值时必现的卡顿。
+            let oldBitmapW = bitmapPixelSize.width
+            let fullBitmapW = CGFloat(full.representations.first?.pixelsWide ?? Int(full.size.width))
+            let unitRatio = oldBitmapW > 0 && fullBitmapW > 0 ? oldBitmapW / fullBitmapW : 1
+            commitCanvasChange {
+                self.imageView.image = full
+                self.bitmapPixelSize = CGSize(
+                    width: full.representations.first?.pixelsWide ?? Int(full.size.width),
+                    height: full.representations.first?.pixelsHigh ?? Int(full.size.height)
+                )
+                self.isFullResolution = true
+                self.scale = newScale
+                self.applyDocument(size: newSize, origin: kept, snap: true)
+                self.fitScale = self.fitScaleValue()
+                if self.zoomTarget != nil, unitRatio != 1 {
+                    self.zoomTarget = self.zoomTarget! * unitRatio
+                    self.zoomStart *= unitRatio
+                }
+            }
+            notifyScale()
         }
 
         private func pan(by delta: CGSize) {
@@ -820,10 +966,12 @@ struct ImageViewCanvas: NSViewRepresentable {
 
         /// 顺时针旋转 90°(可叠加):直接旋转位图后替换 image。
         /// 替换后宽高已对调,bitmapPixelSize 同步翻转,缩放读数/升级判定保持正确。
-        func performRotate() {
+        /// 图片未就绪时返回 false(调用方保留差额,待就绪后重试)。
+        @discardableResult
+        func performRotate() -> Bool {
             guard imageView.image != nil,
                   let cg = imageView.image?.cgImage(forProposedRect: nil, context: nil, hints: nil),
-                  let rotated = ImageLoader.rotatedCW90(cg) else { return }
+                  let rotated = ImageLoader.rotatedCW90(cg) else { return false }
             cancelSmoothZoom()
             absorbMagnification()
             // 动图每帧会用原始帧重建 NSImage,会覆盖旋转结果;先停播再转(静态呈现当前帧的旋转变体)
@@ -837,6 +985,8 @@ struct ImageViewCanvas: NSViewRepresentable {
                 self.applyFit()
             }
             parent.onRotationChange(true)
+            debugLog("performRotate applied")
+            return true
         }
     }
 }
@@ -891,11 +1041,25 @@ final class CanvasClipView: NSClipView {
 
     override func scrollWheel(with event: NSEvent) {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--zoom-debug") {
+            let b = bounds
+            FileHandle.standardError.write(Data(
+                "[scroll] dy=\(event.scrollingDeltaY) dx=\(event.scrollingDeltaX) phase=\(event.momentumPhase.rawValue)/\(event.phase.rawValue) loc=(\(event.locationInWindow.x - b.origin.x),\(event.locationInWindow.y)) origin=\(b.origin)\n".utf8))
+        }
+#endif
         if mods.contains(.command) || mods.contains(.option) {
             // 以光标为锚点缩放(与捏合语义一致)
             onZoomDelta?(event.scrollingDeltaY * 0.01, convert(event.locationInWindow, from: nil))
             return
         }
+#if DEBUG
+        // 漂移实验开关:普通滚轮走捏合同一缩放路径,用真实 HID 事件验证锚定
+        if ProcessInfo.processInfo.arguments.contains("--zoom-scroll-test") {
+            onZoomDelta?(event.scrollingDeltaY * 0.01, convert(event.locationInWindow, from: nil))
+            return
+        }
+#endif
         // 触控板双指横滑(|dx| 明显大于 |dy|)且文档横向不可滚动 → 切图手势;
         // 其余(纵向滚动、惯性余量)交给系统滚动。
         let dx = event.scrollingDeltaX

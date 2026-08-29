@@ -6,6 +6,8 @@ struct InfoInspector: View {
 
     let file: ImageFile?
     @State private var info: ImageInfo?
+    // 窗口背景是透明的(.inspector 会透出去),面板自己铺当前画布背景色;AppStorage 保证设置里改背景时实时同步
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
 
     var body: some View {
         Group {
@@ -58,15 +60,25 @@ struct InfoInspector: View {
                     copyInfo()
                 } label: {
                     Label("复制", systemImage: "doc.on.doc")
+                        .font(.callout)
                 }
+                .controlSize(.small)
+                .buttonStyle(.borderless)
                 .disabled(info == nil)
                 .help("复制全部信息")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(.bar)
+            // 扁平:与面板同色纯底,不带材质厚度;仅靠底部细线与内容分界
+            .background(ChromeTheme.fill(canvasBackground))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(.separator.opacity(0.5))
+                    .frame(height: 1)
+            }
         }
-        .inspectorColumnWidth(min: 220, ideal: 280, max: 380)
+        .background(ChromeTheme.fill(canvasBackground).ignoresSafeArea())
+        .environment(\.colorScheme, ChromeTheme.colorScheme(for: canvasBackground))
     }
 
     private func sectionView(_ section: InfoSection) -> some View {
@@ -88,7 +100,12 @@ struct InfoInspector: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 8).fill(.quinary))
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.quinary)
+                // 面板底色和画布同色,卡片加一圈细描边才有层次
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+        )
     }
 
     private func copyInfo() {

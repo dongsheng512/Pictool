@@ -11,6 +11,9 @@ struct MainContentView: View {
     @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
     @State private var isDropTargeted = false
+    // 信息面板开合动画期间冻结画布重排(真值只维持动画时长,解除后补一次布局)
+    @State private var suppressCanvasLayout = false
+    @State private var layoutFreezeGeneration = 0
     @State private var sidebarWidth: CGFloat = UserDefaults.standard.double(forKey: "sidebarWidth") > 0 ? UserDefaults.standard.double(forKey: "sidebarWidth") : 260
     @State private var dragStartWidth: CGFloat = 260
     @State private var isHoveringDivider = false
@@ -104,7 +107,7 @@ struct MainContentView: View {
                 background: canvasBackground,
                 openZoomMode: openZoomMode,
                 zoomRequest: store.zoomRequest,
-                rotateRequestToken: store.rotateRequestToken,
+                rotationCount: store.rotationCount,
                 stepDirection: store.lastStepDirection,
                 onLoadingChange: { store.imageLoading = $0 },
                 onScaleChange: { store.displayScale = $0 },
@@ -124,10 +127,14 @@ struct MainContentView: View {
                 if store.sidebarVisible {
                     SidebarView()
                         .frame(width: sidebarWidth)
-                        // 1px 分隔线贴在侧栏右边缘
+                        // 1px 分隔线贴在侧栏右边缘(深色画布用白色线,否则不可见)
                         .overlay(alignment: .trailing) {
                             Rectangle()
-                                .fill(isHoveringDivider ? Color.black.opacity(0.14) : Color.black.opacity(0.07))
+                                .fill(
+                                    canvasBackground.isDark
+                                        ? Color.white.opacity(isHoveringDivider ? 0.22 : 0.12)
+                                        : Color.black.opacity(isHoveringDivider ? 0.14 : 0.07)
+                                )
                                 .frame(width: 1)
                         }
                         // 16pt 拖拽热区，居中于分隔线上（左右各 8pt），便于抓取
@@ -156,9 +163,6 @@ struct MainContentView: View {
                 }
                 detail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .inspector(isPresented: Binding(get: { store.showInspector }, set: { store.showInspector = $0 })) {
-                        InfoInspector(file: store.currentImage)
-                    }
                     .sheet(isPresented: $showCropSheet) {
                         if let file = store.currentImage {
                             CropView(file: file, isDisplayRotated: store.isDisplayRotated)
@@ -191,8 +195,11 @@ struct MainContentView: View {
         store.isModalPresented = true
         let url = file.url
         Task {
+            // 打印按纸张分辨率限解码尺寸即可:300dpi 的 A4 满打满算约 3508px 长边,
+            // 再多的像素进不了纸。限住后大图解码从秒级降到毫秒级,不会一直转圈。
+            let printMaxPixel: CGFloat = 3600
             let image = await Task.detached(priority: .userInitiated) {
-                try? ImageLoader.decode(url: url, maxPixelSize: nil)
+                try? ImageLoader.decode(url: url, maxPixelSize: printMaxPixel)
             }.value
             isPreparingPrint = false
             // 打印面板是模态的,从 runModal 返回即代表已关闭
@@ -209,20 +216,22 @@ struct MainContentView: View {
 
     private var detail: some View {
         VStack(spacing: 0) {
-            ZStack {
+            HStack(spacing: 0) {
+                ZStack {
                 ImageViewCanvas(
                     file: store.currentImage,
                     neighborURLs: store.neighborURLs,
                     background: canvasBackground,
                     openZoomMode: openZoomMode,
                     zoomRequest: store.zoomRequest,
-                    rotateRequestToken: store.rotateRequestToken,
+                    rotationCount: store.rotationCount,
                     stepDirection: store.lastStepDirection,
                     onLoadingChange: { store.imageLoading = $0 },
                     onScaleChange: { store.displayScale = $0 },
                     onImageInfo: { store.displayInfo = $0 },
                     onRotationChange: { store.isDisplayRotated = $0 },
-                    onStep: { store.step($0) }
+                    onStep: { store.step($0) },
+                    relayoutSuppressed: suppressCanvasLayout
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contextMenu {
@@ -261,6 +270,21 @@ struct MainContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                }
+
+                infoDrawer
+            }
+            .animation(.easeOut(duration: 0.25), value: store.showInspector)
+            .onChange(of: store.showInspector) { _, _ in
+                // 开合动画期间冻结画布重排:否则 handleLayout 每帧重新 fit,
+                // 图片被连续缩放(挤压生硬感的根源);动画结束后一次性重排。
+                layoutFreezeGeneration += 1
+                let gen = layoutFreezeGeneration
+                suppressCanvasLayout = true
+                Task {
+                    try? await Task.sleep(for: .milliseconds(320))
+                    if gen == layoutFreezeGeneration { suppressCanvasLayout = false }
+                }
             }
             if !store.isImmersive {
                 statusBar
@@ -281,6 +305,20 @@ struct MainContentView: View {
                 .transition(.opacity)
             }
         }
+    }
+
+    /// 挤压式信息面板:内容定宽 280,容器宽度 0↔280 动画,展开过程裁切,
+    /// 面板内部不变形;同色无边无投影,是窗口的一块分区而不是浮层
+    private var infoDrawer: some View {
+        ZStack {
+            if store.showInspector {
+                InfoInspector(file: store.currentImage)
+                    .frame(width: 280)
+            }
+        }
+        .frame(maxHeight: .infinity)
+        .frame(width: store.showInspector ? 280 : 0, alignment: .leading)
+        .clipped()
     }
 
     private var welcomeOverlay: some View {
@@ -458,8 +496,28 @@ struct MainContentView: View {
     // MARK: 自测模式(--zoom-test):自动执行一组缩放动作并记录日志
 
     private func runZoomSelfTestIfRequested() {
+        let args = ProcessInfo.processInfo.arguments
+        // --zoom-autopen:配合 --zoom-debug 抓缩放日志用,启动即打开 Downloads,省去手动开文件夹
+        if args.contains("--zoom-autopen") {
+            let downloads = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads", isDirectory: true)
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                store.openFolder(downloads)
+            }
+            return
+        }
 #if DEBUG
-        guard ProcessInfo.processInfo.arguments.contains("--zoom-test") else { return }
+        // --drift-test:只加载图片并就绪,缩放由真实滚轮事件驱动,日志走 --zoom-debug
+        if args.contains("--drift-test") {
+            Task { @MainActor in
+                store.openFolder(URL(fileURLWithPath: "/tmp/pictool_test"))
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                FileHandle.standardError.write(Data("[drift-test] ready\n".utf8))
+            }
+            return
+        }
+        guard args.contains("--zoom-test") else { return }
         Task { @MainActor in
             let wait: UInt64 = 1_200_000_000
             store.openFolder(URL(fileURLWithPath: "/tmp/pictool_test"))
@@ -477,6 +535,40 @@ struct MainContentView: View {
             FileHandle.standardError.write(Data("[test] fit\n".utf8))
             store.requestZoom(.fit)
             try? await Task.sleep(nanoseconds: wait)
+            // 面板打开状态下再测一轮缩放(对照:面板关闭时的上一组)
+            FileHandle.standardError.write(Data("[test] panel OPEN\n".utf8))
+            store.showInspector = true
+            try? await Task.sleep(nanoseconds: wait * 2)
+            for i in 1...8 {
+                FileHandle.standardError.write(Data("[test] panel+zoomIn #\(i)\n".utf8))
+                store.requestZoom(.zoomIn)
+                try? await Task.sleep(nanoseconds: 400_000_000)
+            }
+            FileHandle.standardError.write(Data("[test] panel CLOSE\n".utf8))
+            store.showInspector = false
+            try? await Task.sleep(nanoseconds: wait)
+            // 旋转 × 纯净模式切换:验证新画布实例能重放完整旋转角度
+            FileHandle.standardError.write(Data("[test] rotate #1\n".utf8))
+            store.requestRotate()
+            try? await Task.sleep(nanoseconds: wait)
+            FileHandle.standardError.write(Data("[test] immersive ON\n".utf8))
+            store.toggleImmersive()
+            try? await Task.sleep(nanoseconds: wait)
+            FileHandle.standardError.write(Data("[test] immersive OFF\n".utf8))
+            store.toggleImmersive()
+            try? await Task.sleep(nanoseconds: wait)
+            FileHandle.standardError.write(Data("[test] rotate #2\n".utf8))
+            store.requestRotate()
+            try? await Task.sleep(nanoseconds: wait)
+            FileHandle.standardError.write(Data("[test] immersive ON again\n".utf8))
+            store.toggleImmersive()
+            try? await Task.sleep(nanoseconds: wait)
+            // 漂移实验:偏心锚点连续小步长放大 4.3 倍,逐 tick 记录锚定偏差
+            FileHandle.standardError.write(Data("[test] drift experiment\n".utf8))
+            NotificationCenter.default.post(
+                name: Notification.Name("PictoolSimAnchorPinch"), object: nil,
+                userInfo: ["ax": 0.3, "ay": 0.3, "steps": 60, "factor": 1.025])
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
             FileHandle.standardError.write(Data("[test] DONE\n".utf8))
         }
 #endif

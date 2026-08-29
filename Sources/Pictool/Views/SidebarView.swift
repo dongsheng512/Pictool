@@ -5,7 +5,9 @@ import AppKit
 struct SidebarView: View {
 
     @Environment(FolderStore.self) private var store
-    @Environment(\.colorScheme) private var colorScheme
+    /// 侧栏明暗跟随画布背景偏好(而不是系统外观)
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
+    private var sidebarScheme: ColorScheme { ChromeTheme.colorScheme(for: canvasBackground) }
     @State private var expandedIDs: Set<FolderNode.ID> = []
     /// 缩略图区是否向上扩展(压缩文件夹树高度);再点一次复原
     @State private var thumbnailsExpanded = false
@@ -24,10 +26,12 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             ZStack {
-                SidebarMaterial()
-                ChromeTheme.sidebarWash(for: colorScheme)
+                SidebarMaterial(dark: canvasBackground.isDark)
+                ChromeTheme.sidebarWash(for: sidebarScheme)
             }
         }
+        // 侧栏内文字/选中态/控件颜色跟随画布背景明暗
+        .environment(\.colorScheme, sidebarScheme)
     }
 
     private var folderTree: some View {
@@ -105,15 +109,25 @@ struct SidebarView: View {
 
 /// Finder 同款侧栏材质(顶栏左侧与侧栏共用)
 struct SidebarMaterial: NSViewRepresentable {
+    /// 跟随画布背景明暗:黑色画布时用深色磨砂(vibrantDark)
+    var dark: Bool = false
+
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.material = .sidebar
         view.blendingMode = .behindWindow
         view.state = .followsWindowActiveState
-        // 保持跟随系统外观，浅色下更通透
+        applyAppearance(to: view)
         return view
     }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        applyAppearance(to: nsView)
+    }
+
+    private func applyAppearance(to view: NSVisualEffectView) {
+        // 磨砂材质的明暗由外观决定;画布选黑时强制深色外观,得到黑色磨砂
+        view.appearance = NSAppearance(named: dark ? .vibrantDark : .aqua)
+    }
 }
 
 enum ChromeTheme {
@@ -144,12 +158,12 @@ struct MainChromeBackground: View {
 
 /// 侧栏顶段(红绿灯列):与侧栏同材质,不跟主区顶栏
 struct SidebarTopBackground: View {
-    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
 
     var body: some View {
         ZStack {
-            SidebarMaterial()
-            ChromeTheme.sidebarWash(for: colorScheme)
+            SidebarMaterial(dark: canvasBackground.isDark)
+            ChromeTheme.sidebarWash(for: ChromeTheme.colorScheme(for: canvasBackground))
         }
     }
 }

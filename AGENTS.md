@@ -1,11 +1,12 @@
 # AGENTS.md
 
-Pictool:macOS 图片查看器(Swift 6 + SwiftUI 混合 AppKit)。**仓库尚无代码,`PLAN.md` 是唯一规格来源**(模块划分、里程碑 M0–M6、技术决策都在里面),动手前先读。选型与竞品的调研依据存档在 `RESEARCH.md`(仅参考,非规格)。以下是其中最易被违反的硬约束。
+Pictool(PureView):macOS 图片查看器(Swift 6 + SwiftUI 混合 AppKit)。主要功能已实现(浏览/信息/裁切/打印/偏好设置),`PLAN.md` 是规格来源(模块划分、里程碑 M0–M6、技术决策都在里面),动手前先读。选型与竞品的调研依据存档在 `RESEARCH.md`(仅参考,非规格)。以下是其中最易被违反的硬约束。
 
 ## 构建 / 测试
 - 纯 SPM 构建,**不建 xcodeproj**(`xcode-select` 当前指向 CommandLineTools);需要 IDE 时用 Xcode 直接打开 `Package.swift`。
-- 开发迭代:`swift build`;打包发布:`./build.sh`(release 构建 + 组装 Pictool.app + ad-hoc 签名,M0 验收标准即此脚本产出可启动的 app)。
+- 开发迭代:`swift build`;打包发布:`./build.sh`(release 构建 + 组装 PureView.app + ad-hoc 签名)。
 - 单测:`swift test`,单个用 `swift test --filter <TestName>`。只测纯逻辑(裁切坐标换算、自然排序、格式识别),不测 UI。
+- **版本号同步**:唯一来源是 `build.sh` 内嵌 Info.plist 模板的 `CFBundleShortVersionString`;功能性变更合入时同步升版本号,并在 `README.md`「版本」小节追加一行变更摘要。
 
 ## 技术约束(勿"优化"掉)
 - 部署目标 macOS 14.0+,Swift 6;**核心零第三方依赖**,SVG / JXL 高画质 / WebP 编码等均为可选二期,不要引包。

@@ -1,4 +1,4 @@
-# PureView v0.10
+# PureView v0.2.0
 
 macOS 原生图片查看器 · Swift 6 + SwiftUI(混合 AppKit) · 零第三方依赖 · 支持 61 种格式
 
@@ -6,7 +6,7 @@ macOS 原生图片查看器 · Swift 6 + SwiftUI(混合 AppKit) · 零第三方�
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![Swift 6](https://img.shields.io/badge/Swift-6-orange) ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
-## ✨ v0.10 亮点
+## ✨ v0.1.0 亮点
 
 - **磨砂侧栏 + 纯净顶栏**：侧栏与顶栏左侧共享 `NSVisualEffectView(.sidebar)` 磨砂，右侧与主区柔白 `#FAFAFB` 同色系，无黑线/无透明缝
 - **可拖中线**：侧栏右缘 `1px 0.07` 细线 + `16pt 居中热区`，`↔` 光标，`180–400pt` 实时拖动并持久到 `UserDefaults`
@@ -84,7 +84,8 @@ Tests/PictoolTests/               # CropMath / ZoomMath / PrintFit / DisplayCach
 
 ## 版本
 
-- **v0.10** (2026-08-24) — 首个可发布预览：磨砂侧栏/纯净顶栏/可拖中线/原生红绿灯/柔和配色/稳定性优化
+- **v0.2.0** (2026-08-29) — 信息面板改挤压式扁平分区(布局冻结,画布不挤压);深色画布下侧栏深色磨砂 + 顶栏/侧栏亮色适配;缩放修复:捏合以视口中心为锚、锚点夹取坐标系混用导致的深缩放画面偏移、全尺寸换图延迟到动画结束(消除跳变与卡顿)、缩放读数语义统一;修复旋转角度跨纯净模式丢失、外部打开主线程扫盘、打印解码限纸张分辨率、删除确认与隐藏恢复等(UI_REVIEW.md 全部 P0/P1 清零)
+- **v0.1.0** (2026-08-24) — 首个可发布预览(当时误标为 v0.10):磨砂侧栏/纯净顶栏/可拖中线/原生红绿灯/柔和配色/稳定性优化
 - 更早见 `git log`
 
 ## 许可证

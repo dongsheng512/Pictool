@@ -6,7 +6,6 @@ import AppKit
 struct PureHeader: View {
 
     @Environment(FolderStore.self) private var store
-    @Environment(\.colorScheme) private var systemColorScheme
     /// 侧栏可见时的宽度,用来把顶栏左段切成独立的「侧栏顶」
     var sidebarWidth: CGFloat? = nil
     @AppStorage(SidebarTopStyle.storageKey) private var sidebarTopStyle = SidebarTopStyle.defaultValue
@@ -28,7 +27,9 @@ struct PureHeader: View {
                         .padding(.leading, 12)
                         .frame(width: width, alignment: .leading)
                         .clipped()
-                        .environment(\.colorScheme, systemColorScheme)
+                        // 左段(侧栏开关/标题)与右段一样跟随画布背景明暗,
+                        // 黑画布下用亮色,否则黑底黑字看不清
+                        .environment(\.colorScheme, mainHeaderColorScheme)
                     rightCluster
                         .padding(.horizontal, 12)
                         .frame(maxWidth: .infinity, alignment: .trailing)

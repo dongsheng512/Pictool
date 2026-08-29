@@ -122,14 +122,16 @@ final class FolderStore {
     }
     private(set) var printRequestToken = 0
     private(set) var cropRequestToken = 0
-    /// 旋转指令通道(token 递增表示新指令;旋转是显示层状态,不写回文件)
-    private(set) var rotateRequestToken = 0
+    /// 当前图累计显示旋转次数(每格 90°;显示层状态,不写回文件)。
+    /// 传次数而不是递增 token:纯净模式/普通模式是两个画布实例,切换时新画布
+    /// 按「次数 - 已应用次数」补齐差值,才能重放完整角度(token 只能重放一刀)。
+    private(set) var rotationCount = 0
     /// 最近一次选图的步进方向:+1 向后,-1 向前,0 点选/无变化
     private(set) var lastStepDirection = 0
 
     func requestRotate() {
         guard currentImage != nil else { return }
-        rotateRequestToken += 1
+        rotationCount += 1
     }
 
     /// 缩放指令通道(token 递增表示新指令)
@@ -214,97 +216,18 @@ final class FolderStore {
         let firstFolder = unique[0].deletingLastPathComponent().standardizedFileURL
         let sameFolder = unique.allSatisfy { $0.deletingLastPathComponent().standardizedFileURL == firstFolder }
 
-        // 同路径已打开时的增量/跳转逻辑
+        // 同路径已打开时的增量/跳转逻辑。
+        // 全量扫盘(目录枚举 + 并行类型判定)不能在主线程做——双击单图/拖入同目录图
+        // 都会走到这里,大文件夹会让 UI 卡住;扫描在后台完成后回主线程执行分支。
         if sameFolder {
-            let allImages = ImageDiscovery.images(in: firstFolder, sortedBy: sortPreference)
-            rememberFolderCount(firstFolder, allImages.count)
-            let hidden = hiddenByFolder[standardized(firstFolder)] ?? []
-            let filteredAll = allImages.filter { !hidden.contains(standardized($0.url)) }
-            let filteredSet = Set(filteredAll.map { $0.id })
-            let currentSet = Set(images.map { $0.id })
-            let isSameFolderAlreadyOpen = selectedFolder?.url.standardizedFileURL == firstFolder || roots.contains(where: { $0.url.standardizedFileURL == firstFolder })
-
-            // 情况1：已在单图模式且同目录 -> 合并保留已打开的，新增本次选择
-            if isSingleImageMode, let src = singleImageSourceFolder, src.standardizedFileURL == firstFolder {
-                var combinedSet = currentSet
-                for u in unique { combinedSet.insert(u) }
-                // 若合并后已全量，且原本就是该目录的单图模式，则直接展示新图（保留已打开的）
-                if combinedSet == filteredSet {
-                    // 已全量：退出单图模式并全量展示，直接跳转
-                    isSingleImageMode = false
-                    singleImageSourceFolder = nil
-                    let node = ensureRoot(firstFolder)
-                    selectedFolderID = node.id
-                    ThumbnailProvider.shared.cancelAll()
-                    DisplayImageCache.shared.cancelAll()
-                    images = filteredAll
-                    if let target = unique.first(where: { filteredSet.contains($0) }) {
-                        selectImage(target)
-                    } else if let first = unique.first {
-                        selectImage(first)
-                    }
-                    return
-                }
-                // 未全量：合并后仍保持单图模式，保留之前已打开的
-                let combined = ImageDiscovery.sorted(Array(combinedSet), by: sortPreference).map { ImageFile(id: $0) }
-                let node = ensureRoot(firstFolder)
-                selectedFolderID = node.id
-                // 保持单图模式
-                isSingleImageMode = true
-                singleImageSourceFolder = firstFolder
-                ThumbnailProvider.shared.cancelAll()
-                DisplayImageCache.shared.cancelAll()
-                images = combined
-                // 跳转到本次新打开的首张（若已在列表则选中它）
-                if let target = unique.first, combinedSet.contains(target) {
-                    selectedImageID = target
-                    lastStepDirection = 0
-                    selectionMemory[standardized(firstFolder)] = target
-                } else {
-                    selectedImageID = combined.first?.id
-                }
-                prefetchNeighbors()
-                return
+            let pref = sortPreference
+            Task { @MainActor in
+                let allImages = await Task.detached(priority: .userInitiated) {
+                    ImageDiscovery.images(in: firstFolder, sortedBy: pref)
+                }.value
+                self.applySameFolderReveal(unique: unique, firstFolder: firstFolder, allImages: allImages)
             }
-
-            // 情况2：已在全量模式且同目录已全量展示 -> 直接跳转
-            if !isSingleImageMode, isSameFolderAlreadyOpen, currentSet == filteredSet, let target = unique.first, filteredSet.contains(target) {
-                // 确保选中该文件夹
-                if let node = roots.first(where: { $0.url.standardizedFileURL == firstFolder }) {
-                    selectedFolderID = node.id
-                } else {
-                    let node = ensureRoot(firstFolder)
-                    selectedFolderID = node.id
-                }
-                // 直接选中目标图
-                if images.contains(where: { $0.id == target }) {
-                    selectImage(target)
-                } else {
-                    // 理论上已全量不应走到这里，兜底全量后选中
-                    isSingleImageMode = false
-                    singleImageSourceFolder = nil
-                    let node = ensureRoot(firstFolder)
-                    selectedFolderID = node.id
-                    images = filteredAll
-                    selectImage(target)
-                }
-                return
-            }
-
-            // 情况3：同目录但尚未全量，且本次非增量单图模式 -> 首次进入单图模式
-            if filteredAll.count > unique.count {
-                let node = ensureRoot(firstFolder)
-                selectedFolderID = node.id
-                isSingleImageMode = true
-                singleImageSourceFolder = firstFolder
-                ThumbnailProvider.shared.cancelAll()
-                DisplayImageCache.shared.cancelAll()
-                images = unique.map { ImageFile(id: $0) }
-                selectedImageID = images.first?.id
-                if let sel = selectedImageID { selectionMemory[standardized(firstFolder)] = sel }
-                prefetchNeighbors()
-                return
-            }
+            return
         }
         // 非同目录多选：作为临时虚拟相册（不关联文件夹，仅展示所选）
         if unique.count > 1 && !sameFolder {
@@ -316,10 +239,111 @@ final class FolderStore {
             ThumbnailProvider.shared.cancelAll()
             DisplayImageCache.shared.cancelAll()
             images = unique.map { ImageFile(id: $0) }
-            selectedImageID = images.first?.id
+            if let first = images.first?.id { setSelectedImage(first) }
             prefetchNeighbors()
             return
         }
+        // 回退：同目录且已全选 / 单张且目录仅一张 → 直接走文件夹全量
+        isSingleImageMode = false
+        singleImageSourceFolder = nil
+        openFolder(firstFolder)
+        if let first = unique.first, images.contains(where: { $0.id == first }) {
+            selectImage(first)
+        }
+    }
+
+    /// 同目录外部打开的三个分支:增量合并 / 已全量直接跳转 / 首次进入单图模式。
+    /// 只做状态修改;扫盘由调用方在后台完成后传入 allImages。
+    private func applySameFolderReveal(unique: [URL], firstFolder: URL, allImages: [ImageFile]) {
+        rememberFolderCount(firstFolder, allImages.count)
+        let hidden = hiddenByFolder[standardized(firstFolder)] ?? []
+        let filteredAll = allImages.filter { !hidden.contains(standardized($0.url)) }
+        let filteredSet = Set(filteredAll.map { $0.id })
+        let currentSet = Set(images.map { $0.id })
+        let isSameFolderAlreadyOpen = selectedFolder?.url.standardizedFileURL == firstFolder || roots.contains(where: { $0.url.standardizedFileURL == firstFolder })
+
+        // 情况1：已在单图模式且同目录 -> 合并保留已打开的，新增本次选择
+        if isSingleImageMode, let src = singleImageSourceFolder, src.standardizedFileURL == firstFolder {
+            var combinedSet = currentSet
+            for u in unique { combinedSet.insert(u) }
+            // 若合并后已全量，且原本就是该目录的单图模式，则直接展示新图（保留已打开的）
+            if combinedSet == filteredSet {
+                // 已全量：退出单图模式并全量展示，直接跳转
+                isSingleImageMode = false
+                singleImageSourceFolder = nil
+                let node = ensureRoot(firstFolder)
+                selectedFolderID = node.id
+                ThumbnailProvider.shared.cancelAll()
+                DisplayImageCache.shared.cancelAll()
+                images = filteredAll
+                if let target = unique.first(where: { filteredSet.contains($0) }) {
+                    selectImage(target)
+                } else if let first = unique.first {
+                    selectImage(first)
+                }
+                return
+            }
+            // 未全量：合并后仍保持单图模式，保留之前已打开的
+            let combined = ImageDiscovery.sorted(Array(combinedSet), by: sortPreference).map { ImageFile(id: $0) }
+            let node = ensureRoot(firstFolder)
+            selectedFolderID = node.id
+            // 保持单图模式
+            isSingleImageMode = true
+            singleImageSourceFolder = firstFolder
+            ThumbnailProvider.shared.cancelAll()
+            DisplayImageCache.shared.cancelAll()
+            images = combined
+            // 跳转到本次新打开的首张（若已在列表则选中它）
+            if let target = unique.first, combinedSet.contains(target) {
+                setSelectedImage(target)
+                lastStepDirection = 0
+                selectionMemory[standardized(firstFolder)] = target
+            } else if let first = combined.first?.id {
+                setSelectedImage(first)
+            }
+            prefetchNeighbors()
+            return
+        }
+
+        // 情况2：已在全量模式且同目录已全量展示 -> 直接跳转
+        if !isSingleImageMode, isSameFolderAlreadyOpen, currentSet == filteredSet, let target = unique.first, filteredSet.contains(target) {
+            // 确保选中该文件夹
+            if let node = roots.first(where: { $0.url.standardizedFileURL == firstFolder }) {
+                selectedFolderID = node.id
+            } else {
+                let node = ensureRoot(firstFolder)
+                selectedFolderID = node.id
+            }
+            // 直接选中目标图
+            if images.contains(where: { $0.id == target }) {
+                selectImage(target)
+            } else {
+                // 理论上已全量不应走到这里，兜底全量后选中
+                isSingleImageMode = false
+                singleImageSourceFolder = nil
+                let node = ensureRoot(firstFolder)
+                selectedFolderID = node.id
+                images = filteredAll
+                selectImage(target)
+            }
+            return
+        }
+
+        // 情况3：同目录但尚未全量，且本次非增量单图模式 -> 首次进入单图模式
+        if filteredAll.count > unique.count {
+            let node = ensureRoot(firstFolder)
+            selectedFolderID = node.id
+            isSingleImageMode = true
+            singleImageSourceFolder = firstFolder
+            ThumbnailProvider.shared.cancelAll()
+            DisplayImageCache.shared.cancelAll()
+            images = unique.map { ImageFile(id: $0) }
+            if let first = images.first?.id { setSelectedImage(first) }
+            if let sel = selectedImageID { selectionMemory[standardized(firstFolder)] = sel }
+            prefetchNeighbors()
+            return
+        }
+
         // 回退：同目录且已全选 / 单张且目录仅一张 → 直接走文件夹全量
         isSingleImageMode = false
         singleImageSourceFolder = nil
@@ -361,9 +385,18 @@ final class FolderStore {
         )
     }
 
-        func selectImage(_ id: ImageFile.ID, direction: Int = 0) {
-        guard images.contains(where: { $0.id == id }) else { return }
+        /// 直选图片的所有路径统一走这里:切到不同图时丢弃当前图的旋转显示态
+    func setSelectedImage(_ id: ImageFile.ID) {
+        if selectedImageID != id {
+            rotationCount = 0
+            isDisplayRotated = false
+        }
         selectedImageID = id
+    }
+
+    func selectImage(_ id: ImageFile.ID, direction: Int = 0) {
+        guard images.contains(where: { $0.id == id }) else { return }
+        setSelectedImage(id)
         lastStepDirection = direction
         if let folder = selectedFolder?.url {
             selectionMemory[standardized(folder)] = standardized(id)
@@ -408,9 +441,9 @@ final class FolderStore {
         func finish(_ files: [ImageFile]) {
             images = files
             if let remembered, images.contains(where: { standardized($0.id) == standardized(remembered) }) {
-                selectedImageID = remembered
+                setSelectedImage(remembered)
             } else if selectedImageID == nil || !images.contains(where: { $0.id == selectedImageID }) {
-                selectedImageID = images.first?.id
+                if let first = images.first?.id { setSelectedImage(first) }
             }
             if let sel = selectedImageID, let folder = selectedFolder?.url {
                 selectionMemory[standardized(folder)] = standardized(sel)
