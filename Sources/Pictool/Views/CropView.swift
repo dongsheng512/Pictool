@@ -2,562 +2,144 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// 裁切模式:独立全窗口 sheet,选区为归一化坐标(原点在图片左上)。
-/// 选区坐标始终基于「变换后」的图幅:四分旋转/翻转/拉直只改像素映射,
-/// 归一化选区不变,因此变换前后选区位置语义连续。
+/// 兼容入口:裁切快捷键停在裁切工具。实现见 `EditView`。
 struct CropView: View {
-
     let file: ImageFile
-    /// 主视图累计的显示旋转(每格 90°)。裁切直接带入同样的初始角度,
-    /// 避免「主视图转了半天、进裁切全丢」的断裂体验。
     var initialQuarterTurns = 0
-    @Environment(\.dismiss) private var dismiss
-
-    // 选区
-    @State private var selection = CGRect(x: 0.08, y: 0.08, width: 0.84, height: 0.84)
-    @State private var ratio: CropRatio = .free
-    @State private var customW = "4"
-    @State private var customH = "3"
-    @FocusState private var editingCustomRatio: Bool
-
-    // 变换(预览与导出共用同一套参数,经 CropTransform 应用)
-    @State private var quarterTurns = 0
-    @State private var flipH = false
-    @State private var flipV = false
-    /// 拉直角度,-45...45,正值顺时针
-    @State private var straighten = 0.0
-
-    // 预览(1500px 降采样;变换后重渲染也在这个尺寸上做)
-    @State private var basePreview: CGImage?
-    @State private var displayPreview: NSImage?
-    @State private var transformedPixelSize = CGSize.zero
-    @State private var previewFailed = false
-    @State private var previewGeneration = 0
-
-    // 撤销/重做(只针对选区)
-    @State private var undoStack: [CGRect] = []
-    @State private var redoStack: [CGRect] = []
-
-    // 导出
-    @State private var exporting = false
-    @State private var errorMessage: String?
-    @State private var format: CropFormat = .png
-    @State private var quality: Double = 0.92
-    @State private var includeGPS = true
-    @State private var maxSideText = ""
 
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            Divider()
-            transformBar
-            Divider()
-            canvasArea
-            Divider()
-            bottomBar
-        }
-        .frame(minWidth: 820, minHeight: 560)
-        .background(hiddenShortcuts)
-        .task { loadPreview() }
-        .alert("导出失败", isPresented: .init(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
-        )) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(errorMessage ?? "")
-        }
-    }
-
-    // MARK: 子视图
-
-    private var topBar: some View {
-        HStack(spacing: 10) {
-            Picker("比例", selection: $ratio) {
-                ForEach(CropRatio.allCases) { r in
-                    Text(r.rawValue).tag(r)
-                }
-            }
-            .pickerStyle(.menu)
-            .frame(width: 92)
-            .onChange(of: ratio) { _, newRatio in
-                // 「原始」也要套一次,让选区对齐图片自身比例
-                if newRatio != .free { snapToRatio() }
-            }
-
-            if ratio == .custom {
-                HStack(spacing: 4) {
-                    TextField("宽", text: $customW)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 46)
-                        .multilineTextAlignment(.center)
-                        .focused($editingCustomRatio)
-                        .onSubmit { snapToRatio() }
-                    Text(":").foregroundStyle(.secondary)
-                    TextField("高", text: $customH)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 46)
-                        .multilineTextAlignment(.center)
-                        .focused($editingCustomRatio)
-                        .onSubmit { snapToRatio() }
-                }
-            }
-
-            // 交换比例方向:预设互换(4:3↔3:4),自定义互换输入值
-            Button {
-                swapRatio()
-            } label: {
-                Image(systemName: "arrow.left.arrow.right")
-                    .frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(!ratio.supportsSwap)
-            .help("交换比例方向(横↔竖)")
-
-            Spacer()
-
-            if transformedPixelSize.width > 0 {
-                Text("\(Int(pixelRect.width.rounded())) × \(Int(pixelRect.height.rounded())) px")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            Button("全选") { mutateSelection(CGRect(x: 0, y: 0, width: 1, height: 1)) }
-                .disabled(previewFailed)
-
-            Button("重置") {
-                mutateSelection(CGRect(x: 0.08, y: 0.08, width: 0.84, height: 0.84))
-            }
-
-            // 覆盖原图只在源格式可直接编码时提供,写回时沿用原格式
-            if overwriteFormat != nil {
-                Button("覆盖原图") { export(overwrite: true) }
-                    .disabled(exporting || transformedPixelSize.width == 0 || previewFailed)
-                    .help("把裁切结果写回原文件,原像素不可恢复")
-            }
-
-            Button("取消") { dismiss() }
-                .keyboardShortcut(.cancelAction)
-
-            Button {
-                export(overwrite: false)
-            } label: {
-                if exporting { ProgressView().controlSize(.small) } else { Text("导出…") }
-            }
-            .keyboardShortcut(.defaultAction)
-            .disabled(exporting || transformedPixelSize.width == 0 || previewFailed)
-        }
-        .padding(12)
-    }
-
-    /// 变换条:旋转 / 翻转 / 拉直 + 撤销重做
-    private var transformBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                quarterTurns -= 1
-            } label: {
-                Image(systemName: "rotate.left").frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(previewFailed)
-            .help("逆时针旋转 90°")
-
-            Button {
-                quarterTurns += 1
-            } label: {
-                Image(systemName: "rotate.right").frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(previewFailed)
-            .help("顺时针旋转 90°")
-
-            Button {
-                flipH.toggle()
-            } label: {
-                Image(systemName: "arrow.left.and.right.righttriangle.left.righttriangle.right")
-                    .frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(previewFailed)
-            .help("水平翻转")
-
-            Button {
-                flipV.toggle()
-            } label: {
-                Image(systemName: "arrow.up.and.down.righttriangle.left.righttriangle.right")
-                    .frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(previewFailed)
-            .help("垂直翻转")
-
-            Divider().frame(height: 14)
-
-            Text("拉直").foregroundStyle(.secondary)
-            Slider(value: $straighten, in: -45...45)
-                .frame(width: 150)
-                .disabled(previewFailed)
-            Text("\(straighten, specifier: "%.1f")°")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 48, alignment: .leading)
-            Button("归零") { straighten = 0 }
-                .disabled(straighten == 0 || previewFailed)
-
-            Spacer()
-
-            Button {
-                undo()
-            } label: {
-                Image(systemName: "chevron.uturn.backward").frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(undoStack.isEmpty)
-            .help("撤销 (⌘Z)")
-
-            Button {
-                redo()
-            } label: {
-                Image(systemName: "chevron.uturn.forward").frame(width: 22, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(redoStack.isEmpty)
-            .help("重做 (⇧⌘Z)")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .onChange(of: quarterTurns) { _, _ in rebuildTransformedPreview() }
-        .onChange(of: flipH) { _, _ in rebuildTransformedPreview() }
-        .onChange(of: flipV) { _, _ in rebuildTransformedPreview() }
-        // 拉直拖动是连续值,防抖后重渲染,拖动手感流畅、预览略有延迟
-        .onChange(of: straighten) { _, _ in scheduleStraightenPreview() }
-    }
-
-    private var canvasArea: some View {
-        ZStack {
-            Color.black.opacity(0.65)
-            if let displayPreview, transformedPixelSize.width > 0 {
-                CropCanvas(
-                    image: displayPreview,
-                    selection: $selection,
-                    lockAspect: lockAspect,
-                    previewAspect: displayPreview.size.width / max(1, displayPreview.size.height),
-                    onInteractionStart: beginUndoGroup
-                )
-                .padding(20)
-            } else if previewFailed {
-                VStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
-                    Text("无法载入此图的像素数据")
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                ProgressView("正在载入原图…")
-            }
-        }
-        .frame(maxHeight: .infinity)
-    }
-
-    private var bottomBar: some View {
-        HStack(spacing: 14) {
-            LabeledContent("导出格式") {
-                Picker("格式", selection: $format) {
-                    ForEach(CropFormat.allCases) { f in
-                        Text(f.rawValue).tag(f)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 240)
-                .onChange(of: format) { _, _ in quality = 0.92 }
-            }
-            if format.isLossy {
-                LabeledContent("质量") {
-                    HStack {
-                        Slider(value: $quality, in: 0.3...1.0)
-                            .frame(width: 120)
-                        Text("\(Int(quality * 100))%")
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .frame(width: 38)
-                    }
-                }
-            }
-            // 显式 HStack 而不是 LabeledContent:LabeledContent 在宽度吃紧时会把
-            // 「最长边」标签折行、把 px 挤出可视区
-            HStack(spacing: 5) {
-                Text("最长边").foregroundStyle(.secondary).fixedSize()
-                TextField("原始", text: $maxSideText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 54)
-                    .multilineTextAlignment(.trailing)
-                Text("px").foregroundStyle(.secondary).fixedSize()
-            }
-            .help("导出时把最长边缩到该像素值,留空保持原始尺寸")
-
-            Toggle("包含位置信息", isOn: $includeGPS)
-                .help("关闭后导出文件不带 GPS 坐标,EXIF 其余部分保留")
-            Spacer()
-        }
-        .padding(12)
-    }
-
-    /// 方向键微调选区 + 撤销快捷键。文字输入框聚焦时方向键要让位给光标移动。
-    private var hiddenShortcuts: some View {
-        Group {
-            Button { nudge(dx: -1, dy: 0) } label: { EmptyView() }
-                .keyboardShortcut(.leftArrow, modifiers: [])
-            Button { nudge(dx: 1, dy: 0) } label: { EmptyView() }
-                .keyboardShortcut(.rightArrow, modifiers: [])
-            Button { nudge(dx: 0, dy: -1) } label: { EmptyView() }
-                .keyboardShortcut(.upArrow, modifiers: [])
-            Button { nudge(dx: 0, dy: 1) } label: { EmptyView() }
-                .keyboardShortcut(.downArrow, modifiers: [])
-            Button { nudge(dx: -4, dy: 0) } label: { EmptyView() }
-                .keyboardShortcut(.leftArrow, modifiers: .shift)
-            Button { nudge(dx: 4, dy: 0) } label: { EmptyView() }
-                .keyboardShortcut(.rightArrow, modifiers: .shift)
-            Button { nudge(dx: 0, dy: -4) } label: { EmptyView() }
-                .keyboardShortcut(.upArrow, modifiers: .shift)
-            Button { nudge(dx: 0, dy: 4) } label: { EmptyView() }
-                .keyboardShortcut(.downArrow, modifiers: .shift)
-            Button { undo() } label: { EmptyView() }
-                .keyboardShortcut("z", modifiers: .command)
-            Button { redo() } label: { EmptyView() }
-                .keyboardShortcut("z", modifiers: [.command, .shift])
-        }
-        .disabled(editingCustomRatio)
-    }
-
-    // MARK: 逻辑
-
-    private var pixelRect: CGRect {
-        CropMath.pixelRect(normalized: selection, pixelSize: transformedPixelSize)
-    }
-
-    /// 比例锁定的目标宽高比;nil(自由/原始/自定义解析失败)时按自由处理
-    private var lockAspect: CGFloat? {
-        let customAspect: CGFloat? = {
-            guard let w = Double(customW), let h = Double(customH), w > 0, h > 0 else { return nil }
-            return CGFloat(w / h)
-        }()
-        let imageAspect = transformedPixelSize.width / max(1, transformedPixelSize.height)
-        return ratio.aspect(imageAspect: imageAspect, customAspect: customAspect)
-    }
-
-    /// 覆盖原图只允许与源扩展名严格对应的格式;RAW/GIF 等不可编码格式不提供该入口
-    private var overwriteFormat: CropFormat? {
-        CropFormat.exactSourceExt(file.url.pathExtension)
-    }
-
-    private func loadPreview() {
-        let url = file.url
-        quarterTurns = ((initialQuarterTurns % 4) + 4) % 4
-        format = CropFormat.default(forSourceExt: url.pathExtension)
-        Task {
-            let image: NSImage? = await Task.detached(priority: .userInitiated) {
-                (try? ImageLoader.decodeWithFacts(url: url, maxPixelSize: 1500))?.image
-            }.value
-            basePreview = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
-            previewFailed = basePreview == nil
-            rebuildTransformedPreview()
-        }
-    }
-
-    private func rebuildTransformedPreview() {
-        guard let base = basePreview else { return }
-        previewGeneration += 1
-        let gen = previewGeneration
-        let turns = quarterTurns, fh = flipH, fv = flipV, deg = straighten
-        Task {
-            let img: CGImage? = await Task.detached(priority: .userInitiated) {
-                CropTransform.apply(to: base, quarterTurns: turns, flipH: fh, flipV: fv, straightenDegrees: deg)
-            }.value
-            guard gen == previewGeneration, let img else { return }
-            displayPreview = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
-            transformedPixelSize = CGSize(width: img.width, height: img.height)
-        }
-    }
-
-    private func scheduleStraightenPreview() {
-        previewGeneration += 1
-        let gen = previewGeneration
-        Task {
-            try? await Task.sleep(for: .milliseconds(120))
-            guard gen == previewGeneration else { return }
-            rebuildTransformedPreview()
-        }
-    }
-
-    // MARK: 选区编辑(撤销栈)
-
-    private func mutateSelection(_ newValue: CGRect) {
-        guard newValue != selection else { return }
-        undoStack.append(selection)
-        redoStack.removeAll()
-        selection = newValue
-    }
-
-    /// 画布拖动开始时由 Canvas 回调:把拖动前的选区压栈,整个拖动算一步
-    private func beginUndoGroup() {
-        undoStack.append(selection)
-        redoStack.removeAll()
-    }
-
-    private func undo() {
-        guard let last = undoStack.popLast() else { return }
-        redoStack.append(selection)
-        selection = last
-    }
-
-    private func redo() {
-        guard let next = redoStack.popLast() else { return }
-        undoStack.append(selection)
-        selection = next
-    }
-
-    /// 方向键微调:参数是步数(1 步 = 0.5%,⇧ 加速为 2%)
-    private func nudge(dx: CGFloat, dy: CGFloat) {
-        guard !previewFailed, transformedPixelSize.width > 0 else { return }
-        var r = selection
-        r.origin.x = min(max(0, r.origin.x + dx * 0.005), 1 - r.width)
-        r.origin.y = min(max(0, r.origin.y + dy * 0.005), 1 - r.height)
-        mutateSelection(r)
-    }
-
-    private func swapRatio() {
-        guard ratio.supportsSwap else { return }
-        if ratio == .custom {
-            let w = customW; customW = customH; customH = w
-        } else if let pair = ratio.labelPair {
-            customW = "\(pair.h)"
-            customH = "\(pair.w)"
-            ratio = .custom
-        }
-        snapToRatio()
-    }
-
-    private func snapToRatio() {
-        guard let aspect = lockAspect, transformedPixelSize.width > 0 else { return }
-        var width = selection.width
-        var height = width / aspect
-        if height > selection.height {
-            height = selection.height
-            width = height * aspect
-        }
-        let x = selection.midX - width / 2
-        let y = selection.midY - height / 2
-        mutateSelection(CropMath.clampedNormalized(CGRect(x: x, y: y, width: width, height: height), minSize: 0.05))
-    }
-
-    // MARK: 导出
-
-    private func export(overwrite: Bool) {
-        guard !exporting, transformedPixelSize.width > 0, !previewFailed else { return }
-        let fmt = overwrite ? (overwriteFormat ?? format) : format
-        if overwrite {
-            let confirm = NSAlert()
-            confirm.messageText = "要覆盖原文件吗?"
-            confirm.informativeText = "“\(file.name)”将被裁切结果替换,原像素不可恢复。"
-            confirm.alertStyle = .warning
-            let overwriteButton = confirm.addButton(withTitle: "覆盖原图")
-            overwriteButton.hasDestructiveAction = true
-            confirm.addButton(withTitle: "取消")
-            guard confirm.runModal() == .alertFirstButtonReturn else { return }
-        }
-        exporting = true
-        let url = file.url
-        let rect = selection
-        let q = quality
-        let turns = quarterTurns, fh = flipH, fv = flipV, deg = straighten
-        let maxSide = Int(maxSideText)
-        let gps = includeGPS
-        Task {
-            let result = await Task.detached(priority: .userInitiated) { () -> Result<Data, Error> in
-                Result {
-                    try CropService.encode(
-                        sourceURL: url, normalizedRect: rect, format: fmt, quality: q,
-                        quarterTurns: turns, flipH: fh, flipV: fv,
-                        straightenDegrees: deg, maxLongestSide: maxSide, includeGPS: gps
-                    )
-                }
-            }.value
-            exporting = false
-            switch result {
-            case .failure(let error):
-                errorMessage = error.localizedDescription
-            case .success(let data):
-                await MainActor.run { save(data: data, overwrite: overwrite, format: fmt) }
-            }
-        }
-    }
-
-    @MainActor
-    private func save(data: Data, overwrite: Bool, format: CropFormat) {
-        if overwrite {
-            do {
-                // 先写临时文件再原子替换,避免写一半毁掉原图
-                let temp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString)
-                    .appendingPathExtension(format.fileExtension)
-                try data.write(to: temp, options: .atomic)
-                if try FileManager.default.replaceItemAt(file.url, withItemAt: temp) == nil {
-                    errorMessage = "替换原文件失败"
-                    return
-                }
-                dismiss()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-            return
-        }
-        let panel = NSSavePanel()
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [UTType(format.uti) ?? .png]
-        let stem = file.url.deletingPathExtension().lastPathComponent
-        panel.nameFieldStringValue = "\(stem)-裁切.\(format.fileExtension)"
-        guard panel.runModal() == .OK, let dest = panel.url else { return }
-        do {
-            try data.write(to: dest, options: .atomic)
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+        EditView(file: file, initialQuarterTurns: initialQuarterTurns, initialTool: .crop)
     }
 }
 
 // MARK: - 选区画布
 
-private struct CropCanvas: View {
+struct CropCanvas: View {
 
     let image: NSImage
     @Binding var selection: CGRect
-    /// 比例锁定的目标宽高比;nil 时自由拖动
+    /// 比例锁定的目标宽高比(像素空间);nil 时自由拖动
     let lockAspect: CGFloat?
-    /// 预览图自身的宽高比(布局用,与比例锁定无关)
+    /// 预览图自身的宽高比。既用于布局,也用于把像素比例折算到归一化选区空间
     let previewAspect: CGFloat
     /// 拖动真正开始改变选区时回调(压撤销栈,整个拖动算一步)
     let onInteractionStart: () -> Void
+    var overlay: NSImage? = nil
+    var watermark: WatermarkSettings = WatermarkSettings()
 
     @State private var dragBaseline: CGRect?
+    @State private var dragStartPoint: CGPoint?
     @State private var undoGroupOpen = false
+    @State private var activeHandle: CropHandle = .move
 
     var body: some View {
         GeometryReader { geo in
             let fit = fittedRect(container: geo.size)
+            let minNorm = max(0.02, 18 / max(fit.width, 1))
+            let shown = displayRect(fit: fit)
             ZStack(alignment: .topLeading) {
                 Image(nsImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: .fit)
                     .frame(width: fit.width, height: fit.height)
-                    .position(x: fit.midX, y: fit.midY)
+                    .offset(x: fit.minX, y: fit.minY)
+                    .allowsHitTesting(false)
+
+                if let overlay {
+                    Image(nsImage: overlay)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: fit.width, height: fit.height)
+                        .offset(x: fit.minX, y: fit.minY)
+                        .allowsHitTesting(false)
+                }
 
                 dimming(fit: fit)
-                selectionOverlay(fit: fit)
+
+                // 水印按裁切输出画幅布局(与导出一致),落在选框内
+                WatermarkStampLayer(settings: watermark, frame: shown)
+
+                thirds(rect: shown)
+                    .allowsHitTesting(false)
+
+                Rectangle()
+                    .strokeBorder(Color.white, lineWidth: 1.5)
+                    .frame(width: shown.width, height: shown.height)
+                    .offset(x: shown.minX, y: shown.minY)
+                    .allowsHitTesting(false)
+
+                ForEach(Array(handleSpecs(rect: shown).enumerated()), id: \.offset) { _, spec in
+                    Rectangle()
+                        .fill(Color.white)
+                        .frame(width: spec.size, height: spec.size)
+                        .overlay(
+                            Rectangle()
+                                .strokeBorder(Color.black.opacity(0.55), lineWidth: 0.5)
+                        )
+                        .shadow(radius: 1)
+                        .frame(width: 20, height: 20)
+                        .offset(x: spec.point.x - 10, y: spec.point.y - 10)
+                        .allowsHitTesting(false)
+                }
+
+                // 显式给尺寸:NSViewRepresentable 没有 intrinsicContentSize,
+                // 不钉住就只有被命中的那一小块能拖,其余区域照样漏给窗口。
+                CanvasMouseCatcher(
+                    onDown: { point in handleDown(point, fit: fit, minNorm: minNorm) },
+                    onDrag: { point in handleDrag(point, fit: fit, minNorm: minNorm) },
+                    onUp: handleUp
+                )
+                .frame(width: geo.size.width, height: geo.size.height)
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+        }
+    }
+
+    /// AppKit 坐标(isFlipped,左上原点)与 SwiftUI 绘制共用同一套 fit。
+    private func handleDown(_ point: CGPoint, fit: CGRect, minNorm: CGFloat) {
+        dragStartPoint = point
+        dragBaseline = selection
+        activeHandle = hitHandle(at: point, fit: fit)
+        if !undoGroupOpen {
+            undoGroupOpen = true
+            onInteractionStart()
+        }
+    }
+
+    private func handleDrag(_ point: CGPoint, fit: CGRect, minNorm: CGFloat) {
+        guard let base = dragBaseline, let start = dragStartPoint else { return }
+        let dx = (point.x - start.x) / max(fit.width, 1)
+        let dy = (point.y - start.y) / max(fit.height, 1)
+        apply(kind: activeHandle, base: base, dx: dx, dy: dy, minNorm: minNorm)
+    }
+
+    private func handleUp() {
+        dragBaseline = nil
+        dragStartPoint = nil
+        undoGroupOpen = false
+        activeHandle = .move
+    }
+
+    private func hitHandle(at location: CGPoint, fit: CGRect) -> CropHandle {
+        let rect = displayRect(fit: fit)
+        let hot: CGFloat = 16
+        for spec in handleSpecs(rect: rect) {
+            if hypot(location.x - spec.point.x, location.y - spec.point.y) <= hot {
+                return spec.kind
             }
         }
-        .aspectRatio(previewAspect, contentMode: .fit)
+        return .move
+    }
+
+    private func thirds(rect: CGRect) -> some View {
+        Path { p in
+            for i in 1...2 {
+                let x = rect.minX + rect.width * CGFloat(i) / 3
+                let y = rect.minY + rect.height * CGFloat(i) / 3
+                p.move(to: CGPoint(x: x, y: rect.minY)); p.addLine(to: CGPoint(x: x, y: rect.maxY))
+                p.move(to: CGPoint(x: rect.minX, y: y)); p.addLine(to: CGPoint(x: rect.maxX, y: y))
+            }
+        }
+        .stroke(Color.white.opacity(0.45), lineWidth: 0.5)
     }
 
     private func fittedRect(container: CGSize) -> CGRect {
@@ -573,7 +155,7 @@ private struct CropCanvas: View {
     /// 选区之外的半透明遮罩(奇偶填充)
     private func dimming(fit: CGRect) -> some View {
         Path { path in
-            path.addRect(CGRect(origin: .zero, size: CGSize(width: fit.maxX, height: fit.maxY)))
+            path.addRect(fit)
             path.addRect(displayRect(fit: fit))
         }
         .fill(Color.black.opacity(0.5), style: FillStyle(eoFill: true))
@@ -587,58 +169,13 @@ private struct CropCanvas: View {
                height: selection.height * fit.height)
     }
 
-    private func selectionOverlay(fit: CGRect) -> some View {
-        let rect = displayRect(fit: fit)
-        let minNorm = max(0.02, 18 / fit.width)
-        return ZStack {
-            // 三分线
-            Path { p in
-                for i in 1...2 {
-                    let x = rect.minX + rect.width * CGFloat(i) / 3
-                    let y = rect.minY + rect.height * CGFloat(i) / 3
-                    p.move(to: CGPoint(x: x, y: rect.minY)); p.addLine(to: CGPoint(x: x, y: rect.maxY))
-                    p.move(to: CGPoint(x: rect.minX, y: y)); p.addLine(to: CGPoint(x: rect.maxX, y: y))
-                }
-            }
-            .stroke(Color.white.opacity(0.45), lineWidth: 0.5)
-            .allowsHitTesting(false)
-
-            Rectangle()
-                .strokeBorder(Color.white, lineWidth: 1.5)
-                .frame(width: rect.width, height: rect.height)
-                .position(x: rect.midX, y: rect.midY)
-                .contentShape(Rectangle())
-                .gesture(dragGesture(kind: .move, fit: fit, minNorm: minNorm))
-
-            ForEach(Array(handleSpecs(fit: fit, rect: rect).enumerated()), id: \.offset) { _, spec in
-                // 视觉尺寸保持精致,但触控热区放大到 20pt——11pt 的方块很难抓准。
-                // 再加一圈深色描边:纯白手柄在亮色照片上完全看不见。
-                ZStack {
-                    Rectangle()
-                        .fill(Color.white)
-                        .frame(width: spec.size, height: spec.size)
-                        .overlay(
-                            Rectangle()
-                                .strokeBorder(Color.black.opacity(0.55), lineWidth: 0.5)
-                                .frame(width: spec.size, height: spec.size)
-                        )
-                        .shadow(radius: 1)
-                }
-                .frame(width: 20, height: 20)
-                .contentShape(Rectangle())
-                .position(spec.point)
-                .gesture(dragGesture(kind: spec.kind, fit: fit, minNorm: minNorm))
-            }
-        }
-    }
-
     private struct HandleSpec {
         let kind: CropHandle
         let point: CGPoint
         let size: CGFloat
     }
 
-    private func handleSpecs(fit: CGRect, rect: CGRect) -> [HandleSpec] {
+    private func handleSpecs(rect: CGRect) -> [HandleSpec] {
         let corner: CGFloat = 11
         let edge: CGFloat = 8
         return [
@@ -651,25 +188,6 @@ private struct CropCanvas: View {
             HandleSpec(kind: .left, point: CGPoint(x: rect.minX, y: rect.midY), size: edge),
             HandleSpec(kind: .right, point: CGPoint(x: rect.maxX, y: rect.midY), size: edge),
         ]
-    }
-
-    private func dragGesture(kind: CropHandle, fit: CGRect, minNorm: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                if dragBaseline == nil { dragBaseline = selection }
-                if !undoGroupOpen {
-                    undoGroupOpen = true
-                    onInteractionStart()
-                }
-                guard let base = dragBaseline else { return }
-                let dx = value.translation.width / fit.width
-                let dy = value.translation.height / fit.height
-                apply(kind: kind, base: base, dx: dx, dy: dy, minNorm: minNorm)
-            }
-            .onEnded { _ in
-                dragBaseline = nil
-                undoGroupOpen = false
-            }
     }
 
     private func apply(kind: CropHandle, base: CGRect, dx: CGFloat, dy: CGFloat, minNorm: CGFloat) {
@@ -692,10 +210,272 @@ private struct CropCanvas: View {
 
         // 比例约束:锚点、尺寸、夹取全部收口在纯函数里(可单测)
         if let aspect = lockAspect {
+            // 比例预设是像素空间的,必须连同图片比例一起交给纯函数折算到归一化空间
             selection = CropMath.ratioLockedRect(free: free, base: base, handle: kind,
-                                                 aspect: aspect, minSize: minNorm)
+                                                 aspect: aspect, imageAspect: previewAspect,
+                                                 minSize: minNorm)
         } else {
             selection = CropMath.clampedNormalized(free, minSize: minNorm)
         }
     }
+}
+
+/// 编辑画布的鼠标入口。SwiftUI `DragGesture` 不会消费 AppKit `mouseDown`,
+/// 而 hiddenTitleBar 窗口默认 `isMovableByWindowBackground`,于是拖手柄/画笔会变成拖窗口。
+///
+/// 这里用 NSView 自己吃事件,并用 `nextEvent` 跟踪循环把 dragged/up 从窗口拖移里抢走。
+struct CanvasMouseCatcher: NSViewRepresentable {
+    var onDown: (CGPoint) -> Void
+    var onDrag: (CGPoint) -> Void
+    var onUp: () -> Void
+    /// 常规光标(按工具设置);悬停到可交互对象上时换手型
+    var baseCursor: NSCursor = .arrow
+    /// 悬停命中测试;nil 表示本画布无可交互对象提示(裁切画布)
+    var hoverHitTest: ((CGPoint) -> Bool)?
+    /// 右键菜单;返回 nil 表示此处无菜单
+    var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+
+    func makeNSView(context: Context) -> Catcher {
+        let view = Catcher()
+        apply(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: Catcher, context: Context) {
+        apply(nsView)
+    }
+
+    private func apply(_ view: Catcher) {
+        view.onDown = onDown
+        view.onDrag = onDrag
+        view.onUp = onUp
+        view.baseCursor = baseCursor
+        view.hoverHitTest = hoverHitTest
+        view.contextMenuProvider = contextMenuProvider
+    }
+
+    final class Catcher: NSView {
+        var onDown: ((CGPoint) -> Void)?
+        var onDrag: ((CGPoint) -> Void)?
+        var onUp: (() -> Void)?
+        var baseCursor: NSCursor = .arrow
+        var hoverHitTest: ((CGPoint) -> Bool)?
+        var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+        private var tracking = false
+        private var hovering = false
+
+        override var isFlipped: Bool { true }
+        override var mouseDownCanMoveWindow: Bool { false }
+        override var acceptsFirstResponder: Bool { true }
+
+        /// 传进来的点在父视图坐标系,必须先转换再与 bounds 比较。
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            bounds.contains(convert(point, from: superview)) ? self : nil
+        }
+
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if !trackingAreas.contains(where: { $0.owner === self }) {
+                addTrackingArea(NSTrackingArea(
+                    rect: .zero,
+                    options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                    owner: self
+                ))
+            }
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let point = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(point), let test = hoverHitTest else {
+                setHovering(false)
+                return
+            }
+            setHovering(test(point))
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            setHovering(false)
+        }
+
+        private func setHovering(_ value: Bool) {
+            guard hovering != value else { return }
+            hovering = value
+            window?.invalidateCursorRects(for: self)
+        }
+
+        override func resetCursorRects() {
+            addCursorRect(bounds, cursor: hovering ? .pointingHand : baseCursor)
+        }
+
+        override func menu(for event: NSEvent) -> NSMenu? {
+            guard let provider = contextMenuProvider else { return super.menu(for: event) }
+            let point = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(point) else { return super.menu(for: event) }
+            return provider(point)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            // 不调用 super:NSView.mouseDown 会把事件交给窗口拖移。
+            tracking = true
+            setHovering(false)
+            onDown?(convert(event.locationInWindow, from: nil))
+            runTrackingLoop()
+        }
+
+        /// 把随后的 dragged/up 从窗口 run loop 里抽走,避免「手势和拖窗口同时发生」。
+        private func runTrackingLoop() {
+            guard let window else {
+                finishTracking()
+                return
+            }
+            while tracking {
+                guard let next = window.nextEvent(
+                    matching: [.leftMouseDragged, .leftMouseUp],
+                    until: .distantFuture,
+                    inMode: .eventTracking,
+                    dequeue: true
+                ) else { break }
+                switch next.type {
+                case .leftMouseDragged:
+                    onDrag?(convert(next.locationInWindow, from: nil))
+                default:
+                    finishTracking()
+                }
+            }
+        }
+
+        private func finishTracking() {
+            guard tracking else { return }
+            tracking = false
+            onUp?()
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { finishTracking() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+    }
+}
+
+/// 编辑会话期间关掉「点背景拖窗口」。由 EditView 挂上,消失时还原。
+struct WindowBackgroundMoveLock: NSViewRepresentable {
+    var allowMove: Bool
+
+    func makeNSView(context: Context) -> LockView {
+        let view = LockView()
+        view.allowMove = allowMove
+        return view
+    }
+
+    func updateNSView(_ view: LockView, context: Context) {
+        view.allowMove = allowMove
+        view.apply()
+    }
+
+    final class LockView: NSView {
+        var allowMove = true
+        private var holding = false
+        override var mouseDownCanMoveWindow: Bool { allowMove }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { release() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        func apply() {
+            if allowMove {
+                release()
+                WindowMoveControl.setBackgroundMove(true)
+            } else {
+                hold()
+            }
+        }
+
+        private func hold() {
+            guard !holding else { return }
+            holding = true
+            WindowMoveControl.pushEditLock()
+        }
+
+        private func release() {
+            guard holding else { return }
+            holding = false
+            WindowMoveControl.popEditLock()
+        }
+    }
+}
+
+@MainActor
+enum WindowMoveControl {
+    /// 编辑会话持有锁时,其它调用方(侧栏分隔条、ChromeView 重挂)不能把背景拖移再打开。
+    private static var editLockCount = 0
+
+    static func pushEditLock() {
+        editLockCount += 1
+        apply(allowed: false)
+    }
+
+    static func popEditLock() {
+        editLockCount = max(0, editLockCount - 1)
+        apply(allowed: editLockCount == 0)
+    }
+
+    static func setBackgroundMove(_ allowed: Bool) {
+        apply(allowed: allowed)
+    }
+
+    private static func apply(allowed: Bool) {
+        let window = NSApp.windows.first { $0.identifier?.rawValue == "main" }
+            ?? NSApp.mainWindow
+            ?? NSApp.keyWindow
+        window?.isMovableByWindowBackground = editLockCount > 0 ? false : allowed
+    }
+}
+
+/// 把水印烙成透明图再铺进给定框(裁切选区 = 导出画幅)。
+struct WatermarkStampLayer: View {
+    let settings: WatermarkSettings
+    let frame: CGRect
+
+    var body: some View {
+        if settings.hasContent, frame.width > 2, frame.height > 2, let image = stamp {
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: frame.width, height: frame.height)
+                .offset(x: frame.minX, y: frame.minY)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var stamp: NSImage? {
+        // 量化尺寸,拖选框时不要每像素重烙一遍。
+        let width = max(64, min(1200, (frame.width * 2 / 8).rounded() * 8))
+        let height = max(64, min(1200, (width * frame.height / max(frame.width, 1) / 8).rounded() * 8))
+        let key = stampKey(width: Int(width), height: Int(height))
+        if let cached = Self.cache.object(forKey: key) { return cached }
+        guard let cg = WatermarkRenderer.overlay(
+            settings, canvasSize: CGSize(width: width, height: height), force: true
+        ) else { return nil }
+        let image = NSImage(cgImage: cg, size: NSSize(width: frame.width, height: frame.height))
+        Self.cache.setObject(image, forKey: key)
+        return image
+    }
+
+    private func stampKey(width: Int, height: Int) -> NSString {
+        "\(width)x\(height)|\(settings.enabled)|\(settings.text)|\(settings.useLogo)|\(settings.logoPath ?? "")|\(settings.position.rawValue)|\(settings.opacity)|\(settings.sizeFraction)|\(settings.tiled)|\(settings.tileSpacing)" as NSString
+    }
+
+    private static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 24
+        return cache
+    }()
 }

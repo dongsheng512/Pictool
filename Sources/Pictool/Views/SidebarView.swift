@@ -142,8 +142,23 @@ enum ChromeTheme {
         canvas.isDark ? Color(white: 0.10) : mainAreaFill
     }
 
+    /// 编辑/浏览画布:比顶栏底栏略深,工作区才从界面里分出来。
+    static func canvasFill(_ canvas: CanvasBackground) -> Color {
+        canvas.isDark ? Color(white: 0.07) : Color(red: 0.945, green: 0.945, blue: 0.950)
+    }
+
+    /// 编辑工具条与顶栏同一底色,只靠 hairline 分开,避免两层色块。
+    static func editBarFill(_ canvas: CanvasBackground) -> Color {
+        fill(canvas)
+    }
+
     static func colorScheme(for canvas: CanvasBackground) -> ColorScheme {
         canvas.isDark ? .dark : .light
+    }
+
+    /// 顶栏与编辑条之间的淡实线(不透明,避免透出窗口)
+    static func hairline(_ canvas: CanvasBackground) -> Color {
+        canvas.isDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)
     }
 }
 

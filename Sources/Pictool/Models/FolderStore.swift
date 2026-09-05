@@ -51,9 +51,14 @@ final class FolderStore {
     var showInspector = false
     /// 只看图:窗口内隐藏顶栏/侧栏/状态栏/信息面板
     var isImmersive = false
-    /// 当前是否有模态面板(裁切 sheet / 打印面板)打开。
-    /// 裸键快捷键(I/C/F/0/1/←/→)此时必须失效,否则会在面板背后改动浏览状态。
+    /// 当前是否有模态占用(编辑模式 / 打印面板)。
+    /// 裸键快捷键(I/F/0/1/←/→)此时必须失效,否则会在编辑背后改动浏览状态。
+    /// `C`/`D` 在编辑中仍可用,用来切换裁切/文字工具。
     var isModalPresented = false
+    /// 主窗口内编辑(不弹 sheet)。为 true 时详情区换成 EditView。
+    var isEditing = false
+    /// 文字草稿输入中:裸键菜单(C/D 等)让位给文本输入
+    var isTextDraftActive = false
     /// 侧栏是否可见(普通模式;纯净模式下强制隐藏,退出后恢复)
     var sidebarVisible = true
     private var sidebarBeforeImmersive = true
@@ -128,6 +133,10 @@ final class FolderStore {
     }
     private(set) var printRequestToken = 0
     private(set) var cropRequestToken = 0
+    private(set) var markupRequestToken = 0
+    private(set) var editRequestToken = 0
+    /// 打开统一编辑 sheet 时停在哪一档工具(`C` 裁切 / `D` 文字)
+    private(set) var editTool: EditTool = .text
     /// 当前图累计显示旋转次数(每格 90°;显示层状态,不写回文件)。
     /// 传次数而不是递增 token:纯净模式/普通模式是两个画布实例,切换时新画布
     /// 按「次数 - 已应用次数」补齐差值,才能重放完整角度(token 只能重放一刀)。
@@ -608,8 +617,38 @@ final class FolderStore {
     }
 
     func requestCrop() {
-        guard currentImage != nil else { return }
+        beginEdit(tool: .crop)
         cropRequestToken += 1
+    }
+
+    /// 标记编辑器(文字/画笔/马赛克);与裁切共用主窗口编辑模式
+    func requestMarkup() {
+        beginEdit(tool: .text)
+        markupRequestToken += 1
+    }
+
+    /// 顶栏编辑按钮:未编辑则展开工具条,已编辑则退出。
+    func toggleEditing() {
+        if isEditing {
+            endEditing()
+        } else {
+            beginEdit(tool: .text)
+        }
+    }
+
+    func beginEdit(tool: EditTool) {
+        guard currentImage != nil else { return }
+        editTool = tool
+        guard !isEditing else { return }
+        isEditing = true
+        isModalPresented = true
+        if isSlideshowActive { isSlideshowPaused = true }
+    }
+
+    func endEditing() {
+        isEditing = false
+        isModalPresented = false
+        isTextDraftActive = false
     }
 
     // MARK: - 缩略图右键操作(复制 / 隐藏 / 删除)

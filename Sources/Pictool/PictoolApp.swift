@@ -52,11 +52,13 @@ struct PictoolApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @State private var store = FolderStore()
+    @State private var annotations = AnnotationStore()
 
     var body: some Scene {
         Window("PureView", id: "main") {
             MainContentView()
                 .environment(store)
+                .environment(annotations)
                 .ignoresSafeArea(.container, edges: .top)
                 .onAppear { delegate.store = store }
                 .onReceive(NotificationCenter.default.publisher(for: .openExternalURLs)) { note in
@@ -132,7 +134,14 @@ struct PictoolApp: App {
                     .disabled(store.currentImage == nil || store.isModalPresented || store.images.count < 2)
                 Button("裁切…") { store.requestCrop() }
                     .keyboardShortcut("c", modifiers: [])
-                    .disabled(store.currentImage == nil || store.isModalPresented)
+                    .disabled(store.currentImage == nil
+                              || (store.isModalPresented && !store.isEditing)
+                              || store.isTextDraftActive)
+                Button("标记…") { store.requestMarkup() }
+                    .keyboardShortcut("d", modifiers: [])
+                    .disabled(store.currentImage == nil
+                              || (store.isModalPresented && !store.isEditing)
+                              || store.isTextDraftActive)
                 Divider()
                 Button("顺时针旋转 90°") { store.requestRotate() }
                     .keyboardShortcut("r", modifiers: [.command, .option])

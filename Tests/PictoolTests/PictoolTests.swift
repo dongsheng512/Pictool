@@ -771,3 +771,603 @@ final class CropRatioLockedTests: XCTestCase {
         XCTAssertEqual(CropMath.anchor(of: .bottomRight).y, .min)
     }
 }
+
+/// 回归用例:比例预设(1:1 / 16:9 …)说的是**像素**宽高比,选区存的是**归一化**坐标。
+/// 少了两者之间的折算,16:9 图上的整图选区(归一化 1:1)会被判成「不合 16:9」,
+/// 手柄只要动 1% 高度就从 1.000 塌到 0.557 —— 也就是「点一下就缩小一半、拖着不跟手」。
+final class CropAspectSpaceTests: XCTestCase {
+
+    private let wide = CGSize(width: 1600, height: 900)          // 16:9
+    private let imageAspect: CGFloat = 1600.0 / 900.0
+
+    /// 复刻 `CropCanvas.apply()`:先按手柄位移算出自由矩形,再套比例约束
+    private func drag(_ handle: CropHandle, dx: CGFloat, dy: CGFloat,
+                      base: CGRect, aspect: CGFloat?, minSize: CGFloat = 0.02) -> CGRect {
+        var minX = base.minX, minY = base.minY, maxX = base.maxX, maxY = base.maxY
+        switch handle {
+        case .move:        minX += dx; maxX += dx; minY += dy; maxY += dy
+        case .topLeft:     minX += dx; minY += dy
+        case .topRight:    maxX += dx; minY += dy
+        case .bottomLeft:  minX += dx; maxY += dy
+        case .bottomRight: maxX += dx; maxY += dy
+        case .top:         minY += dy
+        case .bottom:      maxY += dy
+        case .left:        minX += dx
+        case .right:       maxX += dx
+        }
+        let free = CGRect(x: min(minX, maxX), y: min(minY, maxY),
+                          width: abs(maxX - minX), height: abs(maxY - minY))
+        guard let aspect else { return CropMath.clampedNormalized(free, minSize: minSize) }
+        return CropMath.ratioLockedRect(free: free, base: base, handle: handle,
+                                        aspect: aspect, imageAspect: imageAspect,
+                                        minSize: minSize)
+    }
+
+    func testTinyDragOnFullBleedSelectionDoesNotCollapse() {
+        let base = CGRect(x: 0, y: 0, width: 1, height: 1)
+        for handle in CropHandle.allCases where handle != .move {
+            let r = drag(handle, dx: -0.01, dy: -0.01, base: base, aspect: imageAspect)
+            XCTAssertGreaterThan(r.height, 0.97, "\(handle):1% 的拖动不该让高度塌掉,实际 \(r.height)")
+            XCTAssertGreaterThan(r.width, 0.97, "\(handle):1% 的拖动不该让宽度塌掉,实际 \(r.width)")
+        }
+    }
+
+    func testSquareRatioYieldsSquarePixelsOnWideImage() {
+        let base = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let r = drag(.bottom, dx: 0, dy: -0.2, base: base, aspect: 1)
+        let px = CropMath.pixelRect(normalized: r, pixelSize: wide)
+        XCTAssertEqual(CGFloat(px.width), CGFloat(px.height), accuracy: 2,
+                       "1:1 应裁出正方形像素,实际 \(px.width)×\(px.height)")
+    }
+
+    func testCornerDragAlongSingleAxisStillResizes() {
+        // 归一化 h = w × 16/9 时像素才是正方形;只沿水平方向拖右下角,
+        // 取内解的旧实现会纹丝不动,取较大解才能跟手。
+        let base = CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.3 * imageAspect)
+        let r = drag(.bottomRight, dx: 0.1, dy: 0, base: base, aspect: 1)
+        XCTAssertGreaterThan(r.width, base.width + 0.05, "单轴拖动也该有响应,实际 \(r.width)")
+        XCTAssertEqual(r.minX, base.minX, accuracy: 1e-9)
+        XCTAssertEqual(r.minY, base.minY, accuracy: 1e-9)
+        let px = CropMath.pixelRect(normalized: r, pixelSize: wide)
+        XCTAssertEqual(CGFloat(px.width), CGFloat(px.height), accuracy: 2)
+    }
+
+    func testNormalizedAspectConvertsPixelRatio() {
+        XCTAssertEqual(CropMath.normalizedAspect(1, imageAspect: 16.0 / 9.0), 9.0 / 16.0, accuracy: 1e-9)
+        XCTAssertEqual(CropMath.normalizedAspect(16.0 / 9.0, imageAspect: 16.0 / 9.0), 1, accuracy: 1e-9)
+        // 非法图片比例时退回原值,不产生 NaN
+        XCTAssertEqual(CropMath.normalizedAspect(1.5, imageAspect: 0), 1.5, accuracy: 1e-9)
+    }
+
+    func testFreeRatioDoesNotLockShape() {
+        XCTAssertNil(CropRatio.free.aspect(imageAspect: imageAspect, customAspect: nil))
+        XCTAssertEqual(CropRatio.original.aspect(imageAspect: imageAspect, customAspect: nil) ?? 0,
+                       imageAspect, accuracy: 1e-9)
+        XCTAssertEqual(CropRatio.square.aspect(imageAspect: imageAspect, customAspect: nil) ?? 0, 1)
+        XCTAssertNil(CropRatio.custom.aspect(imageAspect: imageAspect, customAspect: nil))
+        // 自定义比例解析得出时应原样返回
+        XCTAssertEqual(CropRatio.custom.aspect(imageAspect: imageAspect, customAspect: 2.5) ?? 0, 2.5)
+    }
+}
+
+final class MarkupGeometryTests: XCTestCase {
+
+    func testDistancePointToSegment() {
+        // 线段 (0,0)-(1,0),垂足投影在段内
+        XCTAssertEqual(MarkupGeometry.distance(CGPoint(x: 0.5, y: 0.3), segment: .zero, CGPoint(x: 1, y: 0)),
+                       0.3, accuracy: 0.0001)
+        // 投影越界夹到端点
+        XCTAssertEqual(MarkupGeometry.distance(CGPoint(x: 2, y: 0), segment: .zero, CGPoint(x: 1, y: 0)),
+                       1, accuracy: 0.0001)
+        // 零长线段退化为点到点
+        XCTAssertEqual(MarkupGeometry.distance(CGPoint(x: 3, y: 4), segment: .zero, .zero), 5, accuracy: 0.0001)
+    }
+
+    func testStrokeContainsWithTolerance() {
+        let line = [CGPoint(x: 0, y: 0.5), CGPoint(x: 1, y: 0.5)]
+        XCTAssertTrue(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.51), widthFraction: 0.02))
+        XCTAssertFalse(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.9), widthFraction: 0.02))
+    }
+
+    func testMoveClampsToUnit() {
+        let moved = MarkupGeometry.moved(anchor: CGPoint(x: 0.95, y: 0.1),
+                                         by: CGSize(width: 0.2, height: -0.5))
+        XCTAssertEqual(moved.x, 1)
+        XCTAssertEqual(moved.y, 0)
+    }
+
+    func testTranslatedMovesEveryPoint() {
+        let moved = MarkupGeometry.translated(
+            points: [CGPoint(x: 0.1, y: 0.2), CGPoint(x: 0.3, y: 0.4)], dx: 0.05, dy: -0.02
+        )
+        XCTAssertEqual(moved[0].x, 0.15, accuracy: 0.0001)
+        XCTAssertEqual(moved[0].y, 0.18, accuracy: 0.0001)
+        XCTAssertEqual(moved[1].x, 0.35, accuracy: 0.0001)
+        XCTAssertEqual(moved[1].y, 0.38, accuracy: 0.0001)
+        XCTAssertTrue(MarkupGeometry.translated(points: [], dx: 1, dy: 1).isEmpty)
+    }
+
+    func testClampedTranslateMovesFullyInsideStroke() {
+        let stroke = [CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.4, y: 0.2)]
+        let moved = MarkupGeometry.clampedTranslate(points: stroke, dx: 0.1, dy: 0.3)
+        XCTAssertEqual(moved[0].x, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(moved[0].y, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(moved[1].x, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(moved[1].y, 0.5, accuracy: 0.0001)
+    }
+
+    func testClampedTranslateKeepsStrokeWholeAtBoundary() {
+        // 笔画部分出界:整笔收紧到边界,不拆散、不出界
+        let stroke = [CGPoint(x: 0.99, y: 0.5), CGPoint(x: 0.995, y: 0.5)]
+        let moved = MarkupGeometry.clampedTranslate(points: stroke, dx: 0.05, dy: 0)
+        XCTAssertEqual(moved[1].x, 1, accuracy: 0.0001)
+        XCTAssertEqual(moved[1].x - moved[0].x, stroke[1].x - stroke[0].x, accuracy: 0.0001)
+        // 已贴边再往界外推:位移归零
+        let stuck = MarkupGeometry.clampedTranslate(points: moved, dx: 0.02, dy: 0)
+        XCTAssertEqual(stuck[0].x, moved[0].x, accuracy: 0.0001)
+    }
+
+    func testClampedTranslateClampsBothAxesIndependently() {
+        let stroke = [CGPoint(x: 0.1, y: 0.98), CGPoint(x: 0.2, y: 0.99)]
+        let moved = MarkupGeometry.clampedTranslate(points: stroke, dx: 5, dy: 5)
+        XCTAssertEqual(moved[0].x, 0.9, accuracy: 0.0001)  // x 收紧到右边界
+        XCTAssertEqual(moved[1].y, 1, accuracy: 0.0001)    // y 收紧到下边界
+    }
+
+    func testRDPSimplifiesCollinearRun() {
+        var points = [CGPoint(x: 0, y: 0)]
+        for i in 1...50 { points.append(CGPoint(x: CGFloat(i) / 50, y: CGFloat(i) / 50)) }
+        points.append(CGPoint(x: 1, y: 0.5))  // 拐点
+        let simplified = MarkupGeometry.rdp(points, epsilon: 0.005)
+        XCTAssertLessThan(simplified.count, 6)
+        XCTAssertEqual(simplified.first, CGPoint(x: 0, y: 0))
+        XCTAssertEqual(simplified.last, CGPoint(x: 1, y: 0.5))
+        XCTAssertTrue(simplified.contains(CGPoint(x: 1, y: 0.5)))
+    }
+
+    func testRDPKeepsShortInput() {
+        let two = [CGPoint.zero, CGPoint(x: 1, y: 1)]
+        XCTAssertEqual(MarkupGeometry.rdp(two, epsilon: 1), two)
+    }
+
+    func testStrokeBoundsPadsByHalfWidth() {
+        let bounds = MarkupGeometry.strokeBounds([CGPoint(x: 0.2, y: 0.3), CGPoint(x: 0.6, y: 0.3)],
+                                                 widthFraction: 0.02)
+        XCTAssertEqual(bounds?.minX ?? -1, 0.19, accuracy: 0.0001)
+        XCTAssertEqual(bounds?.width ?? -1, 0.42, accuracy: 0.0001)
+    }
+
+    func testTextHitRectContainsAnchorAndStaysNormalized() {
+        let rect = MarkupGeometry.textHitRect(
+            anchor: CGPoint(x: 0.2, y: 0.3),
+            content: "Hi",
+            sizeLevel: 1,
+            imageSize: CGSize(width: 1500, height: 1000)
+        )
+        XCTAssertTrue(rect.contains(CGPoint(x: 0.21, y: 0.31)))
+        XCTAssertLessThan(rect.width, 0.3, "must not treat pixel size as normalized")
+        XCTAssertLessThan(rect.height, 0.3)
+        XCTAssertGreaterThanOrEqual(rect.width, 0.02)
+        XCTAssertFalse(rect.contains(CGPoint(x: 0.95, y: 0.95)))
+    }
+
+    func testRotateCW90ThenCCWRoundTrip() {
+        let p = CGPoint(x: 0.25, y: 0.10)
+        let cw = MarkupGeometry.rotateCW90(p)
+        XCTAssertEqual(cw.x, 0.90, accuracy: 0.0001)
+        XCTAssertEqual(cw.y, 0.25, accuracy: 0.0001)
+        let back = MarkupGeometry.rotateCCW90(cw)
+        XCTAssertEqual(back.x, p.x, accuracy: 0.0001)
+        XCTAssertEqual(back.y, p.y, accuracy: 0.0001)
+    }
+
+    func testTextHitRectClampsOrigin() {
+        let rect = MarkupGeometry.textHitRect(
+            anchor: CGPoint(x: 1.4, y: -0.2),
+            content: "A",
+            sizeLevel: 0,
+            imageSize: CGSize(width: 200, height: 200)
+        )
+        XCTAssertEqual(rect.origin.x, 1, accuracy: 0.0001)
+        XCTAssertEqual(rect.origin.y, 0, accuracy: 0.0001)
+    }
+}
+
+final class WatermarkLayoutTests: XCTestCase {
+
+    private let canvas = CGSize(width: 1000, height: 500)
+
+    func testNineGridCorners() {
+        let content = CGSize(width: 100, height: 40)
+        let topLeft = WatermarkLayout.origin(position: .topLeft, canvasSize: canvas, contentSize: content)
+        XCTAssertEqual(topLeft.x, 20, accuracy: 0.001)   // margin 0.02×1000
+        XCTAssertEqual(topLeft.y, 20, accuracy: 0.001)
+        let bottomRight = WatermarkLayout.origin(position: .bottomRight, canvasSize: canvas, contentSize: content)
+        XCTAssertEqual(bottomRight.x, 880, accuracy: 0.001)
+        XCTAssertEqual(bottomRight.y, 440, accuracy: 0.001)
+        let center = WatermarkLayout.origin(position: .center, canvasSize: canvas, contentSize: content)
+        XCTAssertEqual(center.x, 450, accuracy: 0.001)
+        XCTAssertEqual(center.y, 230, accuracy: 0.001)
+    }
+
+    func testTiledOffsetsCoverCanvasWithConsistentSpacing() {
+        let offsets = WatermarkLayout.tiledOffsets(canvasSize: canvas, spacingFraction: 0.5)
+        XCTAssertFalse(offsets.isEmpty)
+        let xs = Set(offsets.map(\.x))
+        // 网格相对画幅中心铺开,必须盖过旋转后画幅的外接半径(对角线一半)
+        let halfDiagonal = hypot(canvas.width, canvas.height) / 2
+        XCTAssertLessThanOrEqual(xs.min() ?? 0, -halfDiagonal)
+        XCTAssertGreaterThanOrEqual(xs.max() ?? 0, halfDiagonal)
+        // 任意相邻列间距恒为 step
+        let sorted = xs.sorted()
+        if sorted.count > 1 {
+            XCTAssertEqual(sorted[1] - sorted[0], 500, accuracy: 0.001)
+        }
+    }
+}
+
+final class AnnotationRendererTests: XCTestCase {
+
+    func testTextSizePositiveAndMonotonic() {
+        let small = AnnotationRenderer.textSize(content: "测试", sizeFraction: 0.03, canvasWidth: 1000)
+        let large = AnnotationRenderer.textSize(content: "测试", sizeFraction: 0.06, canvasWidth: 1000)
+        XCTAssertGreaterThan(small.width, 0)
+        XCTAssertGreaterThan(small.height, 0)
+        XCTAssertGreaterThan(large.width, small.width)
+        XCTAssertGreaterThan(large.height, small.height)
+    }
+
+    func testTextSizeScalesLinearlyWithCanvas() {
+        let a = AnnotationRenderer.textSize(content: "PureView", sizeFraction: 0.04, canvasWidth: 1000)
+        let b = AnnotationRenderer.textSize(content: "PureView", sizeFraction: 0.04, canvasWidth: 2000)
+        // 字体度量带亚像素舍入,线性度放宽到 2%
+        XCTAssertEqual(b.width / a.width, 2, accuracy: 0.04)
+        XCTAssertEqual(b.height / a.height, 2, accuracy: 0.04)
+    }
+
+    func testRenderOverlayProducesImage() throws {
+        let annotations = [
+            Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.1), content: "标记",
+                                   sizeLevel: 1, colorIndex: 0)),
+            Annotation(kind: .stroke(points: [.zero, CGPoint(x: 0.5, y: 0.5)],
+                                     widthLevel: 1, colorIndex: 2)),
+        ]
+        let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
+            annotations: annotations, canvasSize: CGSize(width: 400, height: 300), base: nil
+        ))
+        XCTAssertEqual(image.width, 400)
+        XCTAssertEqual(image.height, 300)
+    }
+
+    func testPixelateReducesToBlockGrid() throws {
+        // 4×1 纯色图,块宽 0.5 → 输出仍为 4×1(分辨率不变,内容块化)
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 4, height: 1, bitsPerComponent: 8,
+                                          bytesPerRow: 16, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 4, height: 1))
+        let base = try XCTUnwrap(ctx.makeImage())
+        let pixelated = try XCTUnwrap(AnnotationRenderer.pixelated(base, blockFraction: 0.5))
+        XCTAssertEqual(pixelated.width, 4)
+        XCTAssertEqual(pixelated.height, 1)
+    }
+
+    func testTextOverlayHasInkNearNormalizedAnchor() throws {
+        let annotations = [
+            Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.1), content: "测",
+                                   sizeLevel: 2, colorIndex: 1))
+        ]
+        let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
+            annotations: annotations, canvasSize: CGSize(width: 200, height: 100), base: nil
+        ))
+        var found = false
+        for x in 12..<90 where !found {
+            for y in 4..<55 {
+                if TestPixels.alpha(image, x: x, y: y) > 20 { found = true; break }
+            }
+        }
+        XCTAssertTrue(found, "CoreText 烙印应在锚点附近留下非透明像素")
+    }
+
+    func testTextStrokeAndFillDoNotDuplicateHorizontally() throws {
+        let content = "12345"
+        let canvas = CGSize(width: 400, height: 200)
+        let sizeLevel = 2
+        let annotations = [
+            Annotation(kind: .text(anchor: CGPoint(x: 0.08, y: 0.25), content: content,
+                                   sizeLevel: sizeLevel, colorIndex: 2))
+        ]
+        let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
+            annotations: annotations, canvasSize: canvas, base: nil
+        ))
+        let expected = AnnotationRenderer.textSize(
+            content: content,
+            sizeFraction: MarkPalette.fraction(MarkPalette.textSizes, level: sizeLevel),
+            canvasWidth: canvas.width
+        )
+        var minX = image.width, maxX = 0
+        for x in 0..<image.width {
+            for y in 0..<image.height {
+                guard TestPixels.alpha(image, x: x, y: y) > 20 else { continue }
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+            }
+        }
+        XCTAssertLessThan(minX, image.width, "应画出文字")
+        let inkWidth = CGFloat(maxX - minX + 1)
+        XCTAssertLessThan(
+            inkWidth, expected.width * 1.55,
+            "文字只应有一份实心填充;重复 CTLineDraw 且未复位 textPosition 会画出两倍宽"
+        )
+        XCTAssertGreaterThan(inkWidth, expected.width * 0.45)
+    }
+
+    func testTextFillMatchesPaletteColor() throws {
+        let annotations = [
+            Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.2), content: "A",
+                                   sizeLevel: 2, colorIndex: 2))
+        ]
+        let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
+            annotations: annotations, canvasSize: CGSize(width: 240, height: 160), base: nil
+        ))
+        var foundFill = false
+        for x in 0..<image.width where !foundFill {
+            for y in 0..<image.height {
+                let p = TestPixels.rgba(image, x: x, y: y)
+                guard p.3 > 180 else { continue }
+                XCTAssertGreaterThan(p.0, 160, "应是调色盘红色,不是描边白/黑")
+                XCTAssertLessThan(p.1, 80)
+                XCTAssertLessThan(p.2, 80)
+                foundFill = true
+                break
+            }
+        }
+        XCTAssertTrue(foundFill, "应能采到不透明的文字像素")
+    }
+}
+
+final class WatermarkRenderTests: XCTestCase {
+
+    func testTextWatermarkLandsBottomRightNotTopLeft() throws {
+        let width = 400, height = 300
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        var settings = WatermarkSettings()
+        settings.enabled = true
+        settings.text = "WM"
+        settings.position = .bottomRight
+        settings.opacity = 1
+        settings.sizeFraction = 0.12
+        settings.tiled = false
+        WatermarkRenderer.draw(settings, in: ctx, canvasSize: CGSize(width: width, height: height))
+        let image = try XCTUnwrap(ctx.makeImage())
+
+        XCTAssertFalse(TestPixels.hasInk(image, x: 0..<80, y: 0..<60), "左上应保持底色")
+        XCTAssertTrue(
+            TestPixels.hasInk(image, x: (width / 2)..<width, y: (height / 2)..<height),
+            "右下象限应有水印墨迹"
+        )
+    }
+
+    func testPreviewStampIsVisibleOnRedImage() throws {
+        let width = 400, height = 300
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let base = try XCTUnwrap(ctx.makeImage())
+        var settings = WatermarkSettings()
+        settings.text = "WM"
+        settings.opacity = 1
+        settings.sizeFraction = 0.2
+        settings.position = .center
+        let preview = try XCTUnwrap(WatermarkRenderer.preview(settings, onto: base, maxPixel: 400, force: true))
+        XCTAssertTrue(
+            TestPixels.hasInkNotRed(preview, x: (width / 4)..<(width * 3 / 4), y: (height / 4)..<(height * 3 / 4)),
+            "预览应在画面中部烙出非纯红的水印像素"
+        )
+    }
+
+    func testDefaultSizePreviewStampIsVisible() throws {
+        let width = 720, height = 480
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let base = try XCTUnwrap(ctx.makeImage())
+        var settings = WatermarkSettings()
+        settings.text = "PureView"
+        settings.position = .bottomRight
+        let preview = try XCTUnwrap(WatermarkRenderer.preview(settings, onto: base, maxPixel: 720, force: true))
+        XCTAssertTrue(
+            TestPixels.hasInkNotRed(preview, x: (width / 2)..<width, y: (height / 2)..<height),
+            "默认字号烙印也应在右下象限可见"
+        )
+    }
+
+    func testOverlayOnCropSizedCanvasLandsBottomRight() throws {
+        var settings = WatermarkSettings()
+        settings.text = "WM"
+        settings.opacity = 1
+        settings.sizeFraction = 0.15
+        settings.position = .bottomRight
+        let canvas = CGSize(width: 200, height: 100)
+        let overlay = try XCTUnwrap(WatermarkRenderer.overlay(settings, canvasSize: canvas, force: true))
+        XCTAssertTrue(
+            TestPixels.hasInk(overlay, x: 100..<200, y: 50..<100),
+            "裁切后的画幅上,右下水印应落在该画幅右下"
+        )
+        XCTAssertFalse(TestPixels.hasInk(overlay, x: 0..<40, y: 0..<30))
+    }
+
+    func testTransparentOverlayKeepsFullTextInk() throws {
+        var settings = WatermarkSettings()
+        settings.text = "Copyright"
+        settings.opacity = 1
+        settings.sizeFraction = 0.12
+        settings.position = .bottomRight
+        let overlay = try XCTUnwrap(
+            WatermarkRenderer.overlay(settings, canvasSize: CGSize(width: 400, height: 300), force: true)
+        )
+        XCTAssertTrue(
+            TestPixels.hasInk(overlay, x: (200)..<400, y: (150)..<300),
+            "透明叠层应在右下画出完整水印,不能只剩截断字形"
+        )
+        XCTAssertFalse(TestPixels.hasInk(overlay, x: 0..<80, y: 0..<60))
+    }
+
+    func testEmptyWatermarkDoesNotPaint() throws {
+        let width = 80, height = 60
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        var settings = WatermarkSettings()
+        settings.enabled = true
+        settings.text = "   "
+        WatermarkRenderer.draw(settings, in: ctx, canvasSize: CGSize(width: width, height: height))
+        let image = try XCTUnwrap(ctx.makeImage())
+        XCTAssertTrue(TestPixels.isNearlyBlack(image, x: width / 2, y: height / 2))
+        XCTAssertTrue(TestPixels.isNearlyBlack(image, x: width - 4, y: height - 4))
+    }
+
+    func testFittedWatermarkTextStaysInsideCanvas() {
+        var settings = WatermarkSettings()
+        settings.enabled = true
+        settings.text = String(repeating: "Copyright ", count: 16)
+        settings.sizeFraction = 0.2
+        let canvas = CGSize(width: 200, height: 80)
+        let size = WatermarkRenderer.contentSize(settings: settings, canvasSize: canvas)
+        XCTAssertLessThanOrEqual(size.width, canvas.width * 0.96 + 0.5)
+        XCTAssertGreaterThan(size.width, 0)
+        let fraction = WatermarkRenderer.resolvedSizeFraction(settings: settings, canvasSize: canvas)
+        XCTAssertLessThan(fraction, settings.sizeFraction)
+    }
+
+    func testWatermarkFillIsWhiteNotStrokedCopy() throws {
+        let width = 320, height = 180
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        var settings = WatermarkSettings()
+        settings.enabled = true
+        settings.text = "WM"
+        settings.opacity = 1
+        settings.sizeFraction = 0.18
+        settings.position = .center
+        WatermarkRenderer.draw(settings, in: ctx, canvasSize: CGSize(width: width, height: height))
+        let image = try XCTUnwrap(ctx.makeImage())
+        var foundWhite = false
+        for x in 40..<(width - 40) where !foundWhite {
+            for y in 30..<(height - 30) {
+                let p = TestPixels.rgba(image, x: x, y: y)
+                if p.0 > 180, p.1 > 180, p.2 > 180 {
+                    foundWhite = true
+                    break
+                }
+            }
+        }
+        XCTAssertTrue(foundWhite, "水印应为白色实心字")
+    }
+
+    func testHasContentFallsBackToTextWhenLogoMissing() {
+        var settings = WatermarkSettings()
+        settings.useLogo = true
+        settings.logoPath = nil
+        settings.text = "hello"
+        XCTAssertTrue(settings.hasContent)
+        settings.text = "  "
+        XCTAssertFalse(settings.hasContent)
+    }
+}
+
+@MainActor
+final class AnnotationStoreTests: XCTestCase {
+
+    func testRoundTripAndIsolationByURL() {
+        let store = AnnotationStore()
+        let a = URL(fileURLWithPath: "/tmp/a.jpg")
+        let b = URL(fileURLWithPath: "/tmp/b.jpg")
+        let mark = Annotation(kind: .text(anchor: CGPoint(x: 0.2, y: 0.3), content: "x",
+                                          sizeLevel: 1, colorIndex: 2))
+        store.set([mark], for: a)
+        XCTAssertEqual(store.annotations(for: a).count, 1)
+        XCTAssertTrue(store.annotations(for: b).isEmpty)
+        store.set([], for: a)
+        XCTAssertTrue(store.annotations(for: a).isEmpty)
+    }
+
+    func testStandardizedFileURLUnifiesKeys() {
+        let store = AnnotationStore()
+        let mark = Annotation(kind: .stroke(points: [.zero, CGPoint(x: 1, y: 1)],
+                                            widthLevel: 0, colorIndex: 0))
+        store.set([mark], for: URL(fileURLWithPath: "/tmp/foo.jpg"))
+        XCTAssertEqual(AnnotationStore.storageKey(for: URL(fileURLWithPath: "/tmp/foo.jpg")),
+                       AnnotationStore.storageKey(for: URL(fileURLWithPath: "/tmp/foo.jpg/")))
+        XCTAssertEqual(store.annotations(for: URL(fileURLWithPath: "/tmp/foo.jpg/")).count, 1)
+    }
+}
+
+private enum TestPixels {
+    static func rgba(_ image: CGImage, x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+        var pixel = [UInt8](repeating: 0, count: 4)
+        guard let cropped = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else {
+            return (0, 0, 0, 0)
+        }
+        pixel.withUnsafeMutableBytes { ptr in
+            guard let ctx = CGContext(
+                data: ptr.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        return (pixel[0], pixel[1], pixel[2], pixel[3])
+    }
+
+    static func alpha(_ image: CGImage, x: Int, y: Int) -> UInt8 {
+        rgba(image, x: x, y: y).3
+    }
+
+    static func isNearlyBlack(_ image: CGImage, x: Int, y: Int) -> Bool {
+        let p = rgba(image, x: x, y: y)
+        return p.0 < 25 && p.1 < 25 && p.2 < 25
+    }
+
+    static func hasInk(_ image: CGImage, x: Range<Int>, y: Range<Int>) -> Bool {
+        for px in x {
+            for py in y {
+                if !isNearlyBlack(image, x: px, y: py) { return true }
+            }
+        }
+        return false
+    }
+
+    static func hasInkNotRed(_ image: CGImage, x: Range<Int>, y: Range<Int>) -> Bool {
+        for px in x {
+            for py in y {
+                let p = rgba(image, x: px, y: py)
+                if p.1 > 40 || p.2 > 40 || p.0 < 200 { return true }
+            }
+        }
+        return false
+    }
+}

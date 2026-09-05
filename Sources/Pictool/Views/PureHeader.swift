@@ -103,42 +103,52 @@ struct PureHeader: View {
 
     private var rightCluster: some View {
         HStack(spacing: 5) {
-            HeaderButton("folder.badge.plus", help: "打开图片文件夹 (⌘O)") {
-                store.openFolderPanel()
+            if !store.isEditing {
+                HeaderButton("folder.badge.plus", help: "打开图片文件夹 (⌘O)") {
+                    store.openFolderPanel()
+                }
+                HeaderDivider()
             }
-            HeaderDivider()
             HeaderButton("chevron.left", help: "上一张 (←)",
                          disabled: !store.canStep(-1)) { store.step(-1) }
             HeaderButton("chevron.right", help: "下一张 (→)",
                          disabled: !store.canStep(1)) { store.step(1) }
             HeaderDivider()
-            HeaderButton("minus.magnifyingglass", help: "缩小 (⌘-)",
-                         disabled: store.currentImage == nil) { store.requestZoom(.zoomOut) }
-            HeaderButton("plus.magnifyingglass", help: "放大 (⌘=)",
-                         disabled: store.currentImage == nil) { store.requestZoom(.zoomIn) }
-            HeaderDivider()
-            HeaderButton("rotate.right", help: "顺时针旋转 90°",
-                         disabled: store.currentImage == nil) { store.requestRotate() }
-            HeaderButton("crop", help: "裁切 (C)",
-                         disabled: store.currentImage == nil) { store.requestCrop() }
-            HeaderButton("printer", help: "打印 (⌘P)",
-                         disabled: store.currentImage == nil) { store.requestPrint() }
+            if !store.isEditing {
+                HeaderButton("minus.magnifyingglass", help: "缩小 (⌘-)",
+                             disabled: store.currentImage == nil) { store.requestZoom(.zoomOut) }
+                HeaderButton("plus.magnifyingglass", help: "放大 (⌘=)",
+                             disabled: store.currentImage == nil) { store.requestZoom(.zoomIn) }
+                HeaderDivider()
+                HeaderButton("rotate.right", help: "顺时针旋转 90°",
+                             disabled: store.currentImage == nil) { store.requestRotate() }
+            }
+            HeaderButton("square.and.pencil",
+                         help: store.isEditing ? "退出编辑" : "编辑 (D)",
+                         disabled: store.currentImage == nil,
+                         emphasized: store.isEditing) { store.toggleEditing() }
+            if !store.isEditing {
+                HeaderButton("printer", help: "打印 (⌘P)",
+                             disabled: store.currentImage == nil) { store.requestPrint() }
+            }
             HeaderButton("info.circle", help: "图片信息 (I)") {
                 store.showInspector.toggle()
             }
-            HeaderButton(
-                store.isSlideshowActive && !store.isSlideshowPaused ? "pause.circle" : "play.circle",
-                help: store.isSlideshowActive && !store.isSlideshowPaused
-                    ? "暂停幻灯片 (空格)"
-                    : "幻灯片播放 (空格)",
-                disabled: store.currentImage == nil || store.images.count < 2
-            ) { store.toggleSlideshow() }
-            HeaderDivider()
-            HeaderButton(
-                store.isImmersive ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                help: store.isImmersive ? "退出只看图 (Esc / F)" : "只看图,隐藏所有界面 (F)",
-                disabled: store.currentImage == nil && !store.isImmersive
-            ) { store.toggleImmersive() }
+            if !store.isEditing {
+                HeaderButton(
+                    store.isSlideshowActive && !store.isSlideshowPaused ? "pause.circle" : "play.circle",
+                    help: store.isSlideshowActive && !store.isSlideshowPaused
+                        ? "暂停幻灯片 (空格)"
+                        : "幻灯片播放 (空格)",
+                    disabled: store.currentImage == nil || store.images.count < 2
+                ) { store.toggleSlideshow() }
+                HeaderDivider()
+                HeaderButton(
+                    store.isImmersive ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                    help: store.isImmersive ? "退出只看图 (Esc / F)" : "只看图,隐藏所有界面 (F)",
+                    disabled: store.currentImage == nil && !store.isImmersive
+                ) { store.toggleImmersive() }
+            }
         }
     }
 }
@@ -147,24 +157,30 @@ private struct HeaderButton: View {
     let systemImage: String
     let help: String
     var disabled = false
+    var emphasized = false
     let action: () -> Void
 
     @State private var hovering = false
 
-    init(_ systemImage: String, help: String, disabled: Bool = false, action: @escaping () -> Void) {
+    init(_ systemImage: String, help: String, disabled: Bool = false,
+         emphasized: Bool = false, action: @escaping () -> Void) {
         self.systemImage = systemImage
         self.help = help
         self.disabled = disabled
+        self.emphasized = emphasized
         self.action = action
     }
 
     var body: some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: 12))
+                .font(.system(size: 12, weight: emphasized ? .semibold : .regular))
                 .frame(width: 24, height: 20)
                 .background(
-                    hovering && !disabled ? Color.primary.opacity(0.08) : .clear,
+                    // 选中态只用填充表达(macOS 工具栏范式):阴影语义是"抬升",和"按下"矛盾
+                    emphasized
+                        ? Color.accentColor.opacity(0.18)
+                        : (hovering && !disabled ? Color.primary.opacity(0.08) : .clear),
                     in: RoundedRectangle(cornerRadius: 4)
                 )
                 .contentShape(Rectangle())

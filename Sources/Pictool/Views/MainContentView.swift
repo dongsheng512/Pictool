@@ -7,7 +7,6 @@ import UniformTypeIdentifiers
 struct MainContentView: View {
 
     @Environment(FolderStore.self) private var store
-    @State private var showCropSheet = false
     @State private var isPreparingPrint = false
     @State private var showZoomMenu = false
     @State private var isDropTargeted = false
@@ -44,7 +43,7 @@ struct MainContentView: View {
             }
         }
         .frame(minWidth: 960, minHeight: 600)
-        .background(WindowChrome(immersive: store.isImmersive))
+        .background(WindowChrome(immersive: store.isImmersive, allowBackgroundMove: !store.isEditing))
         .onAppear {
             CanvasBackground.normalizeStoredValue()
             runZoomSelfTestIfRequested()
@@ -238,9 +237,7 @@ struct MainContentView: View {
                                 )
                                 .onHover { inside in
                                     isHoveringDivider = inside
-                                    if let w = NSApp.keyWindow ?? NSApp.mainWindow {
-                                        w.isMovableByWindowBackground = !inside
-                                    }
+                                    WindowMoveControl.setBackgroundMove(!inside && !store.isEditing)
                                     if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
                                 }
                         }
@@ -248,18 +245,6 @@ struct MainContentView: View {
                 }
                 detail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .sheet(isPresented: $showCropSheet) {
-                        if let file = store.currentImage {
-                            // 裁切带入主视图当前的显示旋转,进裁切不再丢角度
-                            CropView(file: file, initialQuarterTurns: ((store.rotationCount % 4) + 4) % 4)
-                        }
-                    }
-                    .onChange(of: store.cropRequestToken) { _, _ in
-                        showCropSheet = store.currentImage != nil
-                    }
-                    .onChange(of: showCropSheet) { _, presented in
-                        store.isModalPresented = presented
-                    }
                     .onChange(of: store.printRequestToken) { _, _ in
                         prepareAndPrint()
                     }
@@ -270,8 +255,7 @@ struct MainContentView: View {
         }
         .ignoresSafeArea(edges: .top)
         .onDisappear {
-            NSApp.keyWindow?.isMovableByWindowBackground = true
-            NSApp.mainWindow?.isMovableByWindowBackground = true
+            WindowMoveControl.setBackgroundMove(true)
         }
     }
 
@@ -304,6 +288,16 @@ struct MainContentView: View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 ZStack {
+                if store.isEditing, let file = store.currentImage {
+                    EditView(
+                        file: file,
+                        initialQuarterTurns: ((store.rotationCount % 4) + 4) % 4,
+                        initialTool: store.editTool,
+                        onClose: { store.endEditing() }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .id(file.url)
+                } else {
                 ImageViewCanvas(
                     file: store.currentImage,
                     neighborURLs: store.neighborURLs,
@@ -355,6 +349,7 @@ struct MainContentView: View {
                         Text("无法显示“\(current.name)”")
                             .foregroundStyle(.secondary)
                     }
+                }
                 }
                 }
 
@@ -500,7 +495,12 @@ struct MainContentView: View {
                         .controlSize(.mini)
                 }
                 Spacer()
-                zoomMenu
+                if store.isEditing {
+                    Text("适应窗口")
+                        .foregroundStyle(.tertiary)
+                } else {
+                    zoomMenu
+                }
             } else {
                 Text("未打开图片").foregroundStyle(.secondary)
                 Spacer()
@@ -513,6 +513,11 @@ struct MainContentView: View {
         .environment(\.colorScheme, ChromeTheme.colorScheme(for: canvasBackground))
         .background {
             MainChromeBackground(canvas: canvasBackground)
+        }
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(ChromeTheme.hairline(canvasBackground))
+                .frame(height: 1)
         }
     }
 
@@ -775,14 +780,17 @@ private struct SlideshowHUD: View {
 /// 窗口 chrome：移除原生标题栏，仅保留 PureHeader 单层
 private struct WindowChrome: NSViewRepresentable {
     let immersive: Bool
+    var allowBackgroundMove = true
     func makeNSView(context: Context) -> NSView { ChromeView() }
     func updateNSView(_ nsView: NSView, context: Context) {
         (nsView as? ChromeView)?.immersive = immersive
+        (nsView as? ChromeView)?.allowBackgroundMove = allowBackgroundMove
         (nsView as? ChromeView)?.apply()
     }
 }
 private final class ChromeView: NSView {
     var immersive = false
+    var allowBackgroundMove = true
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         apply()
@@ -791,6 +799,7 @@ private final class ChromeView: NSView {
     override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); apply() }
     func apply() { stripTitlebar() }
     private func stripTitlebar() {
+        WindowMoveControl.setBackgroundMove(allowBackgroundMove)
         guard let window else { return }
         window.styleMask.insert(.fullSizeContentView)
         // 记住窗口位置与尺寸,下次启动恢复到上次的位置
@@ -800,7 +809,6 @@ private final class ChromeView: NSView {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.title = ""
-        window.isMovableByWindowBackground = true
         window.backgroundColor = .clear
         window.isOpaque = false
         let radius: CGFloat = immersive ? 0 : 10

@@ -86,58 +86,92 @@ enum CropMath {
         }
     }
 
+    /// 像素空间的宽高比 → 归一化空间的宽高比。
+    ///
+    /// 选区存的是 0...1 归一化坐标,而比例预设(1:1 / 16:9 …)说的是**像素**宽高比。
+    /// 归一化矩形 (w, h) 对应的像素尺寸是 (w·W, h·H),要让像素比等于 `aspect`,
+    /// 归一化比必须是 `aspect·H/W = aspect / imageAspect`。
+    ///
+    /// 漏掉这一步的后果(实测):16:9 的整图选区归一化是 1:1,被判成「不合 16:9」,
+    /// 手柄只要动 1% 选区高度就从 1.000 塌到 0.557——也就是「一点就缩小一半」。
+    static func normalizedAspect(_ aspect: CGFloat, imageAspect: CGFloat) -> CGFloat {
+        guard imageAspect > 0, imageAspect.isFinite else { return aspect }
+        return aspect / imageAspect
+    }
+
+    /// 比例约束下的尺寸求解。
+    /// - 边手柄:被拖的那一轴驱动,另一轴按比例跟随。
+    /// - 角手柄:宽度驱动 / 高度驱动各算一次,**取较大的那个**。
+    ///   只取内接的较小解时,沿单一轴拖动会完全没反应(另一轴一直卡住),手感像卡死。
+    static func lockedSize(free: CGRect, base: CGRect, handle: CropHandle,
+                           aspect: CGFloat, minSize: CGFloat) -> (width: CGFloat, height: CGFloat) {
+        switch handle {
+        case .move:
+            return (base.width, base.height)
+        case .top, .bottom:
+            let height = max(free.height, minSize)
+            return (height * aspect, height)
+        case .left, .right:
+            let width = max(free.width, minSize)
+            return (width, width / aspect)
+        default:
+            let byWidth = max(free.width, minSize)
+            let byHeight = max(free.height, minSize) * aspect
+            let width = max(byWidth, byHeight)
+            return (width, width / aspect)
+        }
+    }
+
     /// 比例约束下求解选区。
     /// - Parameters:
     ///   - free: 未套比例、按拖动位移直接得到的矩形
     ///   - base: 本次拖动开始时的选区(锚点来源)
     ///   - handle: 被拖动的部位
-    ///   - aspect: 目标宽高比(width / height)
+    ///   - aspect: 目标宽高比(width / height),**像素空间**
+    ///   - imageAspect: 图片自身像素宽高比。选区在归一化空间,比例在像素空间,
+    ///     必须先经 `normalizedAspect` 折算,否则宽幅图上选区会被瞬间压扁
     ///   - minSize: 归一化最小边长
     static func ratioLockedRect(free: CGRect, base: CGRect, handle: CropHandle,
-                                aspect: CGFloat, minSize: CGFloat) -> CGRect {
+                                aspect: CGFloat, imageAspect: CGFloat = 1,
+                                minSize: CGFloat) -> CGRect {
         let floor = min(max(minSize, 0), 1)
-        guard aspect > 0 else { return clampedNormalized(free, minSize: floor) }
+        let ratio = normalizedAspect(aspect, imageAspect: imageAspect)
+        guard ratio > 0, ratio.isFinite else {
+            return clampedNormalized(free, minSize: floor)
+        }
 
         let (axKind, ayKind) = anchor(of: handle)
         let anchorX = anchorValue(axKind, min: base.minX, max: base.maxX)
         let anchorY = anchorValue(ayKind, min: base.minY, max: base.maxY)
 
-        // 由被拖动的那一维决定尺寸,另一维按比例跟随
-        var width: CGFloat = 0
-        var height: CGFloat = 0
-        switch handle {
-        case .move:
-            width = base.width
-            height = base.height
-        case .top, .bottom:
-            height = max(free.height, floor)
-            width = height * aspect
-        case .left, .right:
-            width = max(free.width, floor)
-            height = width / aspect
-        default:
-            // 角:先按宽度算,若高度超出则改以高度为准(收缩到自由矩形内)
-            width = max(free.width, floor)
-            height = width / aspect
-            if height > free.height {
-                height = max(free.height, floor)
-                width = height * aspect
-            }
-        }
-
-        // 沿锚定方向的可用空间有限时等比收缩,保持比例
         let availW = available(axKind, anchor: anchorX)
         let availH = available(ayKind, anchor: anchorY)
-        if availW <= 0 || availH <= 0 {
+        guard availW > 0, availH > 0 else {
             return clampedNormalized(base, minSize: floor)
         }
+
+        // 由被拖动的那一维决定尺寸,另一维按比例跟随
+        var (width, height) = lockedSize(free: free, base: base, handle: handle,
+                                         aspect: ratio, minSize: floor)
+
+        // 沿锚定方向的可用空间有限时等比收缩,保持比例
         if width > availW || height > availH {
             let k = min(availW / width, availH / height)
             width *= k
             height *= k
         }
-        width = max(width, floor)
-        height = max(height, floor)
+        // 最小尺寸:任一维不足就整体放大(直接各自取 max 会破坏比例),再夹一次可用空间
+        let grow = max(floor / max(width, .leastNonzeroMagnitude),
+                       floor / max(height, .leastNonzeroMagnitude))
+        if grow > 1 {
+            width *= grow
+            height *= grow
+            if width > availW || height > availH {
+                let k = min(availW / width, availH / height)
+                width *= k
+                height *= k
+            }
+        }
 
         let x = placement(axKind, anchor: anchorX, size: width)
         let y = placement(ayKind, anchor: anchorY, size: height)
@@ -158,11 +192,13 @@ enum CropRatio: String, CaseIterable, Identifiable {
     case custom = "自定义"
     var id: String { rawValue }
 
-    /// 目标宽高比(width / height)。自由/原始跟随图片自身比例;
-    /// 自定义由调用方解析输入框给出,解析不出(≤0)时返回 nil,按自由处理。
+    /// 目标宽高比(width / height,**像素空间**);nil = 不锁形状,自由拖动。
+    /// 「原始」跟随图片自身比例;自定义解析不出(≤0)时返回 nil,按自由处理。
+    /// 「自由」必须返回 nil:比例一旦非 nil,拖动时另一轴就会被比例拖着走,形状改不了。
     func aspect(imageAspect: CGFloat, customAspect: CGFloat?) -> CGFloat? {
         switch self {
-        case .free, .original: return imageAspect
+        case .free: return nil
+        case .original: return imageAspect
         case .square: return 1
         case .fourBy3: return 4.0 / 3.0
         case .threeBy4: return 3.0 / 4.0
@@ -354,8 +390,8 @@ enum CropError: LocalizedError {
 enum CropService {
 
     /// 返回编码后的图片数据,由调用方负责保存面板与写盘。
-    /// 管线:解码全尺寸 → 变换(旋转/翻转/拉直)→ 按归一化选区裁切 → 可选降采样 → 编码。
-    /// 选区归一化坐标基于变换后的图幅,与预览一致。
+    /// 管线:解码 → 变换 → 烙印标记(整张变换图)→ 裁切 → 降采样 → 水印 → 编码。
+    /// 标记坐标是变换后整图的归一化 0...1;裁掉的部分连同框外笔迹一起丢掉。
     static func encode(sourceURL: URL,
                        normalizedRect: CGRect,
                        format: CropFormat,
@@ -365,20 +401,49 @@ enum CropService {
                        flipV: Bool = false,
                        straightenDegrees: Double = 0,
                        maxLongestSide: Int? = nil,
-                       includeGPS: Bool = true) throws -> Data {
+                       includeGPS: Bool = true,
+                       annotations: [Annotation] = [],
+                       watermark: WatermarkSettings? = nil) throws -> Data {
         let full = try ImageLoader.decodeFullCGImage(url: sourceURL)
-        let transformed = CropTransform.apply(
+        var canvas = CropTransform.apply(
             to: full, quarterTurns: quarterTurns, flipH: flipH, flipV: flipV,
             straightenDegrees: straightenDegrees
         )
+        if !annotations.isEmpty {
+            let size = CGSize(width: canvas.width, height: canvas.height)
+            if let ctx = CGContext(
+                data: nil, width: canvas.width, height: canvas.height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: canvas.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            ) {
+                ctx.draw(canvas, in: CGRect(origin: .zero, size: size))
+                AnnotationRenderer.draw(annotations, in: ctx, canvasSize: size, base: canvas)
+                if let stamped = ctx.makeImage() { canvas = stamped }
+            }
+        }
         let rect = CropMath.pixelRect(
             normalized: normalizedRect,
-            pixelSize: CGSize(width: transformed.width, height: transformed.height)
+            pixelSize: CGSize(width: canvas.width, height: canvas.height)
         )
-        guard let cropped = transformed.cropping(to: rect), rect.width > 0, rect.height > 0 else {
+        guard let cropped = canvas.cropping(to: rect), rect.width > 0, rect.height > 0 else {
             throw CropError.decodeFailed
         }
         let output = CropTransform.downscaled(cropped, longestSide: maxLongestSide ?? 0)
+
+        // 水印烙在最終输出像素上(裁切/缩放之后),九宫格与平铺都相对最终画幅
+        var finalOutput = output
+        if let watermark, watermark.enabled, watermark.hasContent {
+            let size = CGSize(width: output.width, height: output.height)
+            if let ctx = CGContext(
+                data: nil, width: output.width, height: output.height, bitsPerComponent: 8,
+                bytesPerRow: 0, space: output.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            ) {
+                ctx.draw(output, in: CGRect(origin: .zero, size: size))
+                WatermarkRenderer.draw(watermark, in: ctx, canvasSize: size)
+                if let composed = ctx.makeImage() { finalOutput = composed }
+            }
+        }
 
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
@@ -400,7 +465,7 @@ enum CropService {
                 properties[kCGImagePropertyGPSDictionary] = gps
             }
         }
-        CGImageDestinationAddImage(dest, output, properties as CFDictionary)
+        CGImageDestinationAddImage(dest, finalOutput, properties as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw CropError.encodeFailed }
         return data as Data
     }
