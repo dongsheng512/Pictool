@@ -459,7 +459,12 @@ enum CropService {
         if let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
             for key in [kCGImagePropertyExifDictionary, kCGImagePropertyIPTCDictionary] {
-                if let value = props[key] { properties[key] = value }
+                if var value = props[key] as? [CFString: Any] {
+                    // 原始尺寸键已因裁切/降采样失效,保留会让看图软件显示错误尺寸
+                    value.removeValue(forKey: kCGImagePropertyExifPixelXDimension)
+                    value.removeValue(forKey: kCGImagePropertyExifPixelYDimension)
+                    properties[key] = value
+                }
             }
             if includeGPS, let gps = props[kCGImagePropertyGPSDictionary] {
                 properties[kCGImagePropertyGPSDictionary] = gps

@@ -4,8 +4,180 @@ import ImageIO
 import UniformTypeIdentifiers
 @testable import Pictool
 
-final class CropMathTests: XCTestCase {
+final class EditCanvasMathTests: XCTestCase {
 
+    private let container = CGSize(width: 800, height: 600)
+
+    func testViewRectMatchesFitAtZoomOne() {
+        // 宽图:适配后横向顶满、纵向居中
+        let wide = EditCanvasMath.viewRect(container: container, imageAspect: 1.5,
+                                           zoom: 1, pan: .zero)
+        XCTAssertEqual(wide.width, 800, accuracy: 0.001)
+        XCTAssertEqual(wide.height, 800 / 1.5, accuracy: 0.001)
+        XCTAssertEqual(wide.minY, (600 - wide.height) / 2, accuracy: 0.001)
+        // 窄图:纵向顶满、横向居中
+        let tall = EditCanvasMath.viewRect(container: container, imageAspect: 0.5,
+                                           zoom: 1, pan: .zero)
+        XCTAssertEqual(tall.width, 300, accuracy: 0.001)
+        XCTAssertEqual(tall.height, 600, accuracy: 0.001)
+        XCTAssertEqual(tall.minX, 250, accuracy: 0.001)
+    }
+
+    func testZoomedKeepsAnchorContentFixed() {
+        let oldRect = EditCanvasMath.viewRect(container: container, imageAspect: 1.5,
+                                              zoom: 2, pan: .zero)
+        let anchor = CGPoint(x: 200, y: 300)
+        let u = (anchor.x - oldRect.minX) / oldRect.width
+        let v = (anchor.y - oldRect.minY) / oldRect.height
+        let result = EditCanvasMath.zoomed(zoom: 2, pan: .zero, factor: 2, anchor: anchor,
+                                           container: container, imageAspect: 1.5)
+        XCTAssertEqual(result.zoom, 4, accuracy: 0.001)
+        let newRect = EditCanvasMath.viewRect(container: container, imageAspect: 1.5,
+                                              zoom: result.zoom, pan: result.pan)
+        XCTAssertEqual((anchor.x - newRect.minX) / newRect.width, u, accuracy: 0.0001)
+        XCTAssertEqual((anchor.y - newRect.minY) / newRect.height, v, accuracy: 0.0001)
+    }
+
+    func testZoomClampsToBounds() {
+        let up = EditCanvasMath.zoomed(zoom: 4, pan: .zero, factor: 1_000_000, anchor: .zero,
+                                       container: container, imageAspect: 1.5)
+        XCTAssertEqual(up.zoom, EditCanvasMath.maxZoom, accuracy: 0.001)
+        let down = EditCanvasMath.zoomed(zoom: 1, pan: .zero, factor: 0.000001, anchor: .zero,
+                                         container: container, imageAspect: 1.5)
+        XCTAssertEqual(down.zoom, EditCanvasMath.minZoom, accuracy: 0.001)
+        // 缩到比容器更小后两方向都居中,pan 归零
+        XCTAssertEqual(down.pan.width, 0, accuracy: 0.001)
+        XCTAssertEqual(down.pan.height, 0, accuracy: 0.001)
+    }
+
+    func testPanClampsWhenZoomed() {
+        let panned = EditCanvasMath.panned(pan: .zero, delta: CGSize(width: 99_999, height: 99_999),
+                                           container: container, imageAspect: 1.5, zoom: 8)
+        XCTAssertEqual(panned.width, (6400 - 800) / 2, accuracy: 0.001)
+        XCTAssertEqual(panned.height, (6400 / 1.5 - 600) / 2, accuracy: 0.001)
+        // 边界上再推不动
+        let stuck = EditCanvasMath.panned(pan: panned, delta: CGSize(width: 100, height: 100),
+                                          container: container, imageAspect: 1.5, zoom: 8)
+        XCTAssertEqual(stuck.width, panned.width, accuracy: 0.001)
+        XCTAssertEqual(stuck.height, panned.height, accuracy: 0.001)
+    }
+
+    func testPanZeroWhenFits() {
+        // 窄图 zoom=1:两方向都居中,pan 恒零
+        let atFit = EditCanvasMath.panned(pan: .zero, delta: CGSize(width: 50, height: 50),
+                                          container: container, imageAspect: 0.5, zoom: 1)
+        XCTAssertEqual(atFit.width, 0, accuracy: 0.001)
+        XCTAssertEqual(atFit.height, 0, accuracy: 0.001)
+        // zoom=2 后纵向超出可平移,横向仍居中
+        let zoomed = EditCanvasMath.panned(pan: .zero, delta: CGSize(width: 50, height: 50),
+                                           container: container, imageAspect: 0.5, zoom: 2)
+        XCTAssertEqual(zoomed.width, 0, accuracy: 0.001)
+        XCTAssertEqual(zoomed.height, 50, accuracy: 0.001)
+    }
+
+    func testPanForCenteredContentKeepsCenterOnResize() {
+        // zoom=2 居中视口:容器中心内容点即 (0.5, 0.5),换容器后仍应在中心
+        let pan = EditCanvasMath.panForCenteredContent(u: 0.5, v: 0.5, zoom: 2,
+                                                       container: CGSize(width: 1000, height: 700),
+                                                       imageAspect: 1.5)
+        XCTAssertEqual(pan.width, 0, accuracy: 0.001)
+        XCTAssertEqual(pan.height, 0, accuracy: 0.001)
+        let rect = EditCanvasMath.viewRect(container: CGSize(width: 1000, height: 700),
+                                           imageAspect: 1.5, zoom: 2, pan: pan)
+        XCTAssertEqual((500 - rect.minX) / rect.width, 0.5, accuracy: 0.0001)
+        XCTAssertEqual((350 - rect.minY) / rect.height, 0.5, accuracy: 0.0001)
+    }
+}
+
+final class ShapeGeometryTests: XCTestCase {
+
+    private let canvas = CGSize(width: 1000, height: 500)
+
+    func testStandardizedRectFlipsNegativeSize() {
+        let rect = MarkupGeometry.standardizedRect(from: CGPoint(x: 0.5, y: 0.8),
+                                                   to: CGPoint(x: 0.2, y: 0.3))
+        XCTAssertEqual(rect.minX, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(rect.minY, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(rect.width, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(rect.height, 0.5, accuracy: 0.0001)
+    }
+
+    func testArrowHeadDirectionAndMinLength() {
+        // 水平向右:尖端在 to,底部回缩
+        let head = MarkupGeometry.arrowHead(from: CGPoint(x: 0, y: 0.5), to: CGPoint(x: 0.5, y: 0.5),
+                                            widthFraction: 0.004, canvasSize: canvas)
+        guard let head else { return XCTFail("head expected") }
+        XCTAssertEqual(head.tip.x, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(head.tip.y, 0.5, accuracy: 0.0001)
+        // 头长(像素)= max(3×0.004×1000, 0.02×500) = 12px → 归一化 x = 0.012
+        let length = head.tip.x - head.baseA.x
+        XCTAssertEqual(length, 0.012, accuracy: 0.0001)
+        // 头部像素宽也是 12px → 归一化 y = 12/500 = 0.024(横竖箭头头部像素形状一致)
+        XCTAssertEqual(head.baseA.y - head.baseB.y, 0.024, accuracy: 0.0001)
+        // 竖直箭头:头部像素尺寸与水平箭头相同(各向异性修复的回归锁)
+        let vertical = MarkupGeometry.arrowHead(from: CGPoint(x: 0.25, y: 0.1),
+                                                to: CGPoint(x: 0.25, y: 0.6),
+                                                widthFraction: 0.004, canvasSize: canvas)
+        guard let v = vertical else { return XCTFail("head expected") }
+        // 竖箭头:x 方向偏移是半宽(6px/1000),y 方向是头长(12px/500)——像素尺寸与横箭头一致
+        XCTAssertEqual(v.tip.x - v.baseA.x, 6.0 / 1000.0, accuracy: 0.0001)
+        XCTAssertEqual(v.tip.y - v.baseA.y, 12.0 / 500.0, accuracy: 0.0001)
+        // 零长度线段无方向
+        XCTAssertNil(MarkupGeometry.arrowHead(from: CGPoint(x: 0.5, y: 0.5),
+                                              to: CGPoint(x: 0.5, y: 0.5),
+                                              widthFraction: 0.004, canvasSize: canvas))
+    }
+
+    func testShapeBoundsPadsAndIncludesArrowHead() {
+        let rectBounds = MarkupGeometry.shapeBounds(kind: .rect,
+                                                    from: CGPoint(x: 0.2, y: 0.2),
+                                                    to: CGPoint(x: 0.4, y: 0.6),
+                                                    widthFraction: 0.01, canvasSize: canvas)
+        XCTAssertEqual(rectBounds?.minX ?? -1, 0.195, accuracy: 0.0001)
+        XCTAssertEqual(rectBounds?.width ?? -1, 0.21, accuracy: 0.0001)
+        // 箭头头部超出 to 点时包围盒应含头
+        let arrowBounds = MarkupGeometry.shapeBounds(kind: .arrow,
+                                                     from: CGPoint(x: 0.2, y: 0.5),
+                                                     to: CGPoint(x: 0.3, y: 0.5),
+                                                     widthFraction: 0.02, canvasSize: canvas)
+        // 头长 = max(3×0.02, 0.01) = 0.06,尖端 0.3、底部 0.24,包围盒仍以 [0.2, 0.3] 为主,横向外扩 pad=0.01
+        XCTAssertEqual(arrowBounds?.minX ?? -1, 0.19, accuracy: 0.0001)
+        XCTAssertEqual(arrowBounds?.maxX ?? -1, 0.31, accuracy: 0.0001)
+        // 纵向应含头的一半宽:头长 60px → 半宽 30px / H500 = 0.06
+        XCTAssertEqual(arrowBounds?.minY ?? -1, 0.5 - 0.06 - 0.01, accuracy: 0.0001)
+        // 退化为零尺寸的 rect 无包围盒
+        XCTAssertNil(MarkupGeometry.shapeBounds(kind: .rect,
+                                                from: CGPoint(x: 0.3, y: 0.3),
+                                                to: CGPoint(x: 0.3, y: 0.3),
+                                                widthFraction: 0.01, canvasSize: canvas))
+    }
+
+    func testHitShapeRectAndEllipseByBounds() {
+        let from = CGPoint(x: 0.2, y: 0.2), to = CGPoint(x: 0.4, y: 0.6)
+        XCTAssertTrue(MarkupGeometry.hitShape(kind: .rect, from: from, to: to, widthFraction: 0.004,
+                                              canvasSize: canvas, at: CGPoint(x: 0.3, y: 0.4)))
+        XCTAssertTrue(MarkupGeometry.hitShape(kind: .ellipse, from: from, to: to, widthFraction: 0.004,
+                                              canvasSize: canvas, at: CGPoint(x: 0.205, y: 0.2)))
+        XCTAssertFalse(MarkupGeometry.hitShape(kind: .rect, from: from, to: to, widthFraction: 0.004,
+                                               canvasSize: canvas, at: CGPoint(x: 0.6, y: 0.4)))
+    }
+
+    func testHitShapeLineToleranceAndArrowHead() {
+        // 水平线 y=0.5,容差 = max(0.004/2, 0.004)+0.006 = 0.008
+        XCTAssertTrue(MarkupGeometry.hitShape(kind: .line, from: CGPoint(x: 0.2, y: 0.5),
+                                              to: CGPoint(x: 0.6, y: 0.5), widthFraction: 0.004,
+                                              canvasSize: canvas, at: CGPoint(x: 0.4, y: 0.507)))
+        XCTAssertFalse(MarkupGeometry.hitShape(kind: .line, from: CGPoint(x: 0.2, y: 0.5),
+                                               to: CGPoint(x: 0.6, y: 0.5), widthFraction: 0.004,
+                                               canvasSize: canvas, at: CGPoint(x: 0.4, y: 0.53)))
+        // 箭头头部三角内命中(头长 0.012,尖端 0.6)
+        XCTAssertTrue(MarkupGeometry.hitShape(kind: .arrow, from: CGPoint(x: 0.2, y: 0.5),
+                                              to: CGPoint(x: 0.6, y: 0.5), widthFraction: 0.004,
+                                              canvasSize: canvas, at: CGPoint(x: 0.594, y: 0.503)))
+    }
+}
+
+final class CropMathTests: XCTestCase {
     func testPixelRectBasicMapping() {
         let rect = CropMath.pixelRect(
             normalized: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5),
@@ -864,9 +1036,62 @@ final class MarkupGeometryTests: XCTestCase {
     }
 
     func testStrokeContainsWithTolerance() {
+        let canvas = CGSize(width: 1000, height: 500)
         let line = [CGPoint(x: 0, y: 0.5), CGPoint(x: 1, y: 0.5)]
-        XCTAssertTrue(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.51), widthFraction: 0.02))
-        XCTAssertFalse(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.9), widthFraction: 0.02))
+        // 容差在像素空间:0.008×1000 = 8px = 归一化 y 0.016
+        XCTAssertTrue(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.51),
+                                            widthFraction: 0.02, canvasSize: canvas))
+        XCTAssertFalse(MarkupGeometry.stroke(line, contains: CGPoint(x: 0.5, y: 0.9),
+                                             widthFraction: 0.02, canvasSize: canvas))
+    }
+
+    func testMappedRoundTripKeepsPayload() {
+        // CW→CCW 往返应回到原位,且 sizeFraction/style/effect/colorIndex 等载荷不丢
+        let original = Annotation(kind: .text(anchor: CGPoint(x: 0.2, y: 0.3),
+                                              content: "标注",
+                                              sizeFraction: 0.05, colorIndex: 3))
+        let roundTrip = MarkupGeometry.mapped(
+            MarkupGeometry.mapped(original, MarkupGeometry.rotateCW90), MarkupGeometry.rotateCCW90
+        )
+        guard case let .text(anchor, content, sizeFraction, colorIndex) = roundTrip.kind else {
+            return XCTFail("kind must stay .text")
+        }
+        XCTAssertEqual(anchor.x, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(anchor.y, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(content, "标注")
+        XCTAssertEqual(sizeFraction, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(colorIndex, 3)
+        let stroke = Annotation(kind: .stroke(points: [.zero, CGPoint(x: 0.4, y: 0.4)],
+                                              widthLevel: 2, colorIndex: 4, style: .highlighter))
+        let strokeTrip = MarkupGeometry.mapped(
+            MarkupGeometry.mapped(stroke, MarkupGeometry.flipH), MarkupGeometry.flipH
+        )
+        XCTAssertEqual(strokeTrip, stroke)
+    }
+
+    func testPanForCenteredContentKeepsOffCenterPoint() {
+        // 偏心内容点:反解后该点应落在容器中心(未触夹取的分支)
+        let newContainer = CGSize(width: 900, height: 700)
+        let u: CGFloat = 0.3, v: CGFloat = 0.3
+        let pan = EditCanvasMath.panForCenteredContent(u: u, v: v, zoom: 2,
+                                                       container: newContainer, imageAspect: 1.5)
+        let rect = EditCanvasMath.viewRect(container: newContainer, imageAspect: 1.5,
+                                           zoom: 2, pan: pan)
+        XCTAssertEqual((newContainer.width / 2 - rect.minX) / rect.width, u, accuracy: 0.0001)
+        XCTAssertEqual((newContainer.height / 2 - rect.minY) / rect.height, v, accuracy: 0.0001)
+    }
+
+    func testExtremeAspectAndZeroContainer() {
+        // 20:1 全景:fit 宽顶满、高极小;缩放/平移不炸
+        let wide = EditCanvasMath.viewRect(container: CGSize(width: 800, height: 600),
+                                           imageAspect: 20, zoom: 2, pan: .zero)
+        XCTAssertEqual(wide.width, 1600, accuracy: 0.001)
+        // 零容器:返回零矩形,缩放/平移安全
+        XCTAssertEqual(EditCanvasMath.viewRect(container: .zero, imageAspect: 1.5,
+                                               zoom: 2, pan: .zero), .zero)
+        let safe = EditCanvasMath.zoomed(zoom: 2, pan: .zero, factor: 1.25, anchor: .zero,
+                                         container: .zero, imageAspect: 1.5)
+        XCTAssertEqual(safe.zoom, 2, accuracy: 0.001)
     }
 
     func testMoveClampsToUnit() {
@@ -941,7 +1166,7 @@ final class MarkupGeometryTests: XCTestCase {
         let rect = MarkupGeometry.textHitRect(
             anchor: CGPoint(x: 0.2, y: 0.3),
             content: "Hi",
-            sizeLevel: 1,
+            sizeFraction: MarkPalette.textSizes[1],
             imageSize: CGSize(width: 1500, height: 1000)
         )
         XCTAssertTrue(rect.contains(CGPoint(x: 0.21, y: 0.31)))
@@ -965,7 +1190,7 @@ final class MarkupGeometryTests: XCTestCase {
         let rect = MarkupGeometry.textHitRect(
             anchor: CGPoint(x: 1.4, y: -0.2),
             content: "A",
-            sizeLevel: 0,
+            sizeFraction: MarkPalette.textSizes[0],
             imageSize: CGSize(width: 200, height: 200)
         )
         XCTAssertEqual(rect.origin.x, 1, accuracy: 0.0001)
@@ -1028,9 +1253,9 @@ final class AnnotationRendererTests: XCTestCase {
     func testRenderOverlayProducesImage() throws {
         let annotations = [
             Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.1), content: "标记",
-                                   sizeLevel: 1, colorIndex: 0)),
+                                   sizeFraction: MarkPalette.textSizes[1], colorIndex: 0)),
             Annotation(kind: .stroke(points: [.zero, CGPoint(x: 0.5, y: 0.5)],
-                                     widthLevel: 1, colorIndex: 2)),
+                                     widthLevel: 1, colorIndex: 2, style: .solid)),
         ]
         let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
             annotations: annotations, canvasSize: CGSize(width: 400, height: 300), base: nil
@@ -1055,7 +1280,7 @@ final class AnnotationRendererTests: XCTestCase {
     func testTextOverlayHasInkNearNormalizedAnchor() throws {
         let annotations = [
             Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.1), content: "测",
-                                   sizeLevel: 2, colorIndex: 1))
+                                   sizeFraction: MarkPalette.textSizes[2], colorIndex: 1))
         ]
         let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
             annotations: annotations, canvasSize: CGSize(width: 200, height: 100), base: nil
@@ -1072,17 +1297,17 @@ final class AnnotationRendererTests: XCTestCase {
     func testTextStrokeAndFillDoNotDuplicateHorizontally() throws {
         let content = "12345"
         let canvas = CGSize(width: 400, height: 200)
-        let sizeLevel = 2
+        let sizeFraction = MarkPalette.textSizes[2]
         let annotations = [
             Annotation(kind: .text(anchor: CGPoint(x: 0.08, y: 0.25), content: content,
-                                   sizeLevel: sizeLevel, colorIndex: 2))
+                                   sizeFraction: sizeFraction, colorIndex: 2))
         ]
         let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
             annotations: annotations, canvasSize: canvas, base: nil
         ))
         let expected = AnnotationRenderer.textSize(
             content: content,
-            sizeFraction: MarkPalette.fraction(MarkPalette.textSizes, level: sizeLevel),
+            sizeFraction: sizeFraction,
             canvasWidth: canvas.width
         )
         var minX = image.width, maxX = 0
@@ -1105,7 +1330,7 @@ final class AnnotationRendererTests: XCTestCase {
     func testTextFillMatchesPaletteColor() throws {
         let annotations = [
             Annotation(kind: .text(anchor: CGPoint(x: 0.1, y: 0.2), content: "A",
-                                   sizeLevel: 2, colorIndex: 2))
+                                   sizeFraction: MarkPalette.textSizes[2], colorIndex: 2))
         ]
         let image = try XCTUnwrap(AnnotationRenderer.renderOverlay(
             annotations: annotations, canvasSize: CGSize(width: 240, height: 160), base: nil
@@ -1307,7 +1532,7 @@ final class AnnotationStoreTests: XCTestCase {
         let a = URL(fileURLWithPath: "/tmp/a.jpg")
         let b = URL(fileURLWithPath: "/tmp/b.jpg")
         let mark = Annotation(kind: .text(anchor: CGPoint(x: 0.2, y: 0.3), content: "x",
-                                          sizeLevel: 1, colorIndex: 2))
+                                          sizeFraction: MarkPalette.textSizes[1], colorIndex: 2))
         store.set([mark], for: a)
         XCTAssertEqual(store.annotations(for: a).count, 1)
         XCTAssertTrue(store.annotations(for: b).isEmpty)
@@ -1318,7 +1543,7 @@ final class AnnotationStoreTests: XCTestCase {
     func testStandardizedFileURLUnifiesKeys() {
         let store = AnnotationStore()
         let mark = Annotation(kind: .stroke(points: [.zero, CGPoint(x: 1, y: 1)],
-                                            widthLevel: 0, colorIndex: 0))
+                                            widthLevel: 0, colorIndex: 0, style: .solid))
         store.set([mark], for: URL(fileURLWithPath: "/tmp/foo.jpg"))
         XCTAssertEqual(AnnotationStore.storageKey(for: URL(fileURLWithPath: "/tmp/foo.jpg")),
                        AnnotationStore.storageKey(for: URL(fileURLWithPath: "/tmp/foo.jpg/")))

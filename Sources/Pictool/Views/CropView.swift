@@ -99,14 +99,15 @@ struct CropCanvas: View {
         dragStartPoint = point
         dragBaseline = selection
         activeHandle = hitHandle(at: point, fit: fit)
-        if !undoGroupOpen {
-            undoGroupOpen = true
-            onInteractionStart()
-        }
+        // 压栈推迟到首次真正拖动:空点不产生"假撤销"
     }
 
     private func handleDrag(_ point: CGPoint, fit: CGRect, minNorm: CGFloat) {
         guard let base = dragBaseline, let start = dragStartPoint else { return }
+        if !undoGroupOpen {
+            undoGroupOpen = true
+            onInteractionStart()
+        }
         let dx = (point.x - start.x) / max(fit.width, 1)
         let dy = (point.y - start.y) / max(fit.height, 1)
         apply(kind: activeHandle, base: base, dx: dx, dy: dy, minNorm: minNorm)
@@ -234,6 +235,16 @@ struct CanvasMouseCatcher: NSViewRepresentable {
     var hoverHitTest: ((CGPoint) -> Bool)?
     /// 右键菜单;返回 nil 表示此处无菜单
     var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+    /// 滚轮/触控板滑动(dx/dy 容器坐标增量,command 是否按住)
+    var onScroll: ((_ dx: CGFloat, _ dy: CGFloat, _ commandHeld: Bool) -> Void)?
+    /// 双指捏合(factor = 1 + magnification,anchor 容器坐标)
+    var onMagnify: ((_ factor: CGFloat, _ anchor: CGPoint) -> Void)?
+    /// 空格拖拽平移(translation = 相对手势起点的位移)
+    var onPanStart: (() -> Void)?
+    var onPanChange: ((_ translation: CGPoint) -> Void)?
+    var onPanEnd: (() -> Void)?
+    /// 空格平移总开关(文字草稿聚焦时关闭,空格让位给文本输入)
+    var spacePanEnabled: Bool = true
 
     func makeNSView(context: Context) -> Catcher {
         let view = Catcher()
@@ -252,6 +263,12 @@ struct CanvasMouseCatcher: NSViewRepresentable {
         view.baseCursor = baseCursor
         view.hoverHitTest = hoverHitTest
         view.contextMenuProvider = contextMenuProvider
+        view.onScroll = onScroll
+        view.onMagnify = onMagnify
+        view.onPanStart = onPanStart
+        view.onPanChange = onPanChange
+        view.onPanEnd = onPanEnd
+        view.spacePanEnabled = spacePanEnabled
     }
 
     final class Catcher: NSView {
@@ -261,8 +278,17 @@ struct CanvasMouseCatcher: NSViewRepresentable {
         var baseCursor: NSCursor = .arrow
         var hoverHitTest: ((CGPoint) -> Bool)?
         var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+        var onScroll: ((_ dx: CGFloat, _ dy: CGFloat, _ commandHeld: Bool) -> Void)?
+        var onMagnify: ((_ factor: CGFloat, _ anchor: CGPoint) -> Void)?
+        var onPanStart: (() -> Void)?
+        var onPanChange: ((_ translation: CGPoint) -> Void)?
+        var onPanEnd: (() -> Void)?
+        var spacePanEnabled = true
         private var tracking = false
         private var hovering = false
+        private var spaceDown = false
+        private var panStart: CGPoint?
+        private var keyMonitor: Any?
 
         override var isFlipped: Bool { true }
         override var mouseDownCanMoveWindow: Bool { false }
@@ -274,6 +300,36 @@ struct CanvasMouseCatcher: NSViewRepresentable {
         }
 
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil {
+                installKeyMonitor()
+            } else {
+                spaceDown = false
+                removeKeyMonitor()
+            }
+        }
+
+        /// 只观察不消费:空格按下态用于「按住空格拖拽平移」;草稿聚焦时 spacePanEnabled 关,不进平移态。
+        private func installKeyMonitor() {
+            guard keyMonitor == nil else { return }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+                if event.keyCode == 49, let self {
+                    self.spaceDown = self.spacePanEnabled && event.type == .keyDown
+                }
+                return event
+            }
+        }
+
+        private func removeKeyMonitor() {
+            if let keyMonitor {
+                NSEvent.removeMonitor(keyMonitor)
+                self.keyMonitor = nil
+            }
+        }
+
+        deinit { removeKeyMonitor() }
 
         override func updateTrackingAreas() {
             super.updateTrackingAreas()
@@ -316,11 +372,30 @@ struct CanvasMouseCatcher: NSViewRepresentable {
             return provider(point)
         }
 
+        /// 非精确 delta(普通滚轮一格 ≈ ±10)放大到可用步长
+        override func scrollWheel(with event: NSEvent) {
+            let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+            guard dx != 0 || dy != 0 else { return }
+            let scale: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 4
+            onScroll?(dx * scale, dy * scale, event.modifierFlags.contains(.command))
+        }
+
+        override func magnify(with event: NSEvent) {
+            guard event.magnification != 0 else { return }
+            onMagnify?(1 + event.magnification, convert(event.locationInWindow, from: nil))
+        }
+
         override func mouseDown(with event: NSEvent) {
             // 不调用 super:NSView.mouseDown 会把事件交给窗口拖移。
             tracking = true
             setHovering(false)
-            onDown?(convert(event.locationInWindow, from: nil))
+            let point = convert(event.locationInWindow, from: nil)
+            if spaceDown, spacePanEnabled {
+                panStart = point
+                onPanStart?()
+            } else {
+                onDown?(point)
+            }
             runTrackingLoop()
         }
 
@@ -337,9 +412,14 @@ struct CanvasMouseCatcher: NSViewRepresentable {
                     inMode: .eventTracking,
                     dequeue: true
                 ) else { break }
+                let point = convert(next.locationInWindow, from: nil)
                 switch next.type {
                 case .leftMouseDragged:
-                    onDrag?(convert(next.locationInWindow, from: nil))
+                    if let start = panStart {
+                        onPanChange?(CGPoint(x: point.x - start.x, y: point.y - start.y))
+                    } else {
+                        onDrag?(point)
+                    }
                 default:
                     finishTracking()
                 }
@@ -349,7 +429,12 @@ struct CanvasMouseCatcher: NSViewRepresentable {
         private func finishTracking() {
             guard tracking else { return }
             tracking = false
-            onUp?()
+            if panStart != nil {
+                panStart = nil
+                onPanEnd?()
+            } else {
+                onUp?()
+            }
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {

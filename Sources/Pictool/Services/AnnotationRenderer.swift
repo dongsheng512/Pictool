@@ -21,11 +21,11 @@ enum AnnotationRenderer {
         var blurCache: [CGFloat: CGImage] = [:]
         for annotation in annotations {
             switch annotation.kind {
-            case let .text(anchor, content, sizeLevel, colorIndex):
-                drawText(content, sizeFraction: MarkPalette.fraction(MarkPalette.textSizes, level: sizeLevel),
+            case let .text(anchor, content, sizeFraction, colorIndex):
+                drawText(content, sizeFraction: MarkPalette.clampTextFraction(sizeFraction),
                          colorIndex: colorIndex, topLeft: anchor, in: ctx, canvasSize: canvasSize)
-            case let .stroke(points, widthLevel, colorIndex):
-                let width = MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel) * canvasSize.width
+            case let .stroke(points, widthLevel, colorIndex, style):
+                let width = MarkPalette.fraction(MarkPalette.widthTable(for: style), level: widthLevel) * canvasSize.width
                 guard let path = strokePath(points, canvasSize: canvasSize) else { continue }
                 ctx.saveGState()
                 ctx.addPath(path)
@@ -33,6 +33,8 @@ enum AnnotationRenderer {
                 ctx.setLineWidth(width)
                 ctx.setLineCap(.round)
                 ctx.setLineJoin(.round)
+                // 荧光笔半透明,同色叠笔自然加深(与预览.app 行为一致)
+                ctx.setAlpha(style == .highlighter ? 0.45 : 1)
                 ctx.strokePath()
                 ctx.restoreGState()
             case let .mosaic(points, widthLevel, effect):
@@ -65,6 +67,60 @@ enum AnnotationRenderer {
                 ctx.draw(effectImage, in: CGRect(origin: .zero, size: canvasSize))
                 ctx.restoreGState()
                 ctx.restoreGState()
+            case let .shape(kind, from, to, widthLevel, colorIndex):
+                drawShape(kind, from: from, to: to,
+                          widthFraction: MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel),
+                          colorIndex: colorIndex, in: ctx, canvasSize: canvasSize)
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    /// 形状:只描边;箭头为线段 + 实心三角头。显示坐标(y 向下)上下文。
+    private static func drawShape(_ kind: ShapeKind, from: CGPoint, to: CGPoint,
+                                  widthFraction: CGFloat, colorIndex: Int,
+                                  in ctx: CGContext, canvasSize: CGSize) {
+        let width = max(1, widthFraction * canvasSize.width)
+        let color = MarkPalette.color(colorIndex).cgColor
+        ctx.saveGState()
+        ctx.setStrokeColor(color)
+        ctx.setFillColor(color)
+        ctx.setLineWidth(width)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        func point(_ p: CGPoint) -> CGPoint {
+            CGPoint(x: p.x * canvasSize.width, y: p.y * canvasSize.height)
+        }
+        switch kind {
+        case .rect, .ellipse:
+            let norm = MarkupGeometry.standardizedRect(from: from, to: to)
+            let pixelRect = CGRect(x: norm.minX * canvasSize.width,
+                                   y: norm.minY * canvasSize.height,
+                                   width: norm.width * canvasSize.width,
+                                   height: norm.height * canvasSize.height)
+            if kind == .rect {
+                ctx.stroke(pixelRect)
+            } else {
+                let ellipse = CGPath(ellipseIn: pixelRect, transform: nil)
+                ctx.addPath(ellipse)
+                ctx.strokePath()
+            }
+        case .line, .arrow:
+            let a = point(from), b = point(to)
+            ctx.move(to: a)
+            ctx.addLine(to: b)
+            ctx.strokePath()
+            if kind == .arrow,
+               let head = MarkupGeometry.arrowHead(from: from, to: to,
+                                                   widthFraction: widthFraction,
+                                                   canvasSize: canvasSize) {
+                let path = CGMutablePath()
+                path.move(to: point(head.tip))
+                path.addLine(to: point(head.baseA))
+                path.addLine(to: point(head.baseB))
+                path.closeSubpath()
+                ctx.addPath(path)
+                ctx.fillPath()
             }
         }
         ctx.restoreGState()
@@ -136,11 +192,26 @@ enum AnnotationRenderer {
 
     // MARK: 效果底图(M4 马赛克/模糊)
 
-    private static let effectCache = NSCache<NSString, CGImage>()
+    /// 效果缓存条目:强持有 base。若只存结果图,base 释放后同尺寸新图的
+    /// ObjectIdentifier 可能复用同址,导致马赛克/模糊烙上另一张图的像素。
+    private final class EffectCacheEntry {
+        let base: CGImage
+        let image: CGImage
+        init(base: CGImage, image: CGImage) {
+            self.base = base
+            self.image = image
+        }
+    }
+
+    private static let effectCache: NSCache<NSString, EffectCacheEntry> = {
+        let cache = NSCache<NSString, EffectCacheEntry>()
+        cache.countLimit = 8
+        return cache
+    }()
 
     static func pixelated(_ base: CGImage, blockFraction: CGFloat) -> CGImage? {
         let cacheKey = "p-\(ObjectIdentifier(base))-\(blockFraction)" as NSString
-        if let cached = effectCache.object(forKey: cacheKey) { return cached }
+        if let entry = effectCache.object(forKey: cacheKey), entry.base === base { return entry.image }
         let blockPx = max(1, blockFraction * CGFloat(base.width))
         let smallW = max(1, Int((CGFloat(base.width) / blockPx).rounded()))
         let smallH = max(1, Int((CGFloat(base.height) / blockPx).rounded()))
@@ -161,7 +232,7 @@ enum AnnotationRenderer {
         bigCtx.interpolationQuality = .none
         bigCtx.draw(small, in: CGRect(x: 0, y: 0, width: base.width, height: base.height))
         guard let result = bigCtx.makeImage() else { return nil }
-        effectCache.setObject(result, forKey: cacheKey)
+        effectCache.setObject(EffectCacheEntry(base: base, image: result), forKey: cacheKey)
         return result
     }
 
@@ -169,7 +240,7 @@ enum AnnotationRenderer {
 
     static func gaussianBlurred(_ base: CGImage, radiusFraction: CGFloat) -> CGImage? {
         let cacheKey = "b-\(ObjectIdentifier(base))-\(radiusFraction)" as NSString
-        if let cached = effectCache.object(forKey: cacheKey) { return cached }
+        if let entry = effectCache.object(forKey: cacheKey), entry.base === base { return entry.image }
         let input = CIImage(cgImage: base)
         // 先边缘延展再模糊,避免高斯在四边吃出透明带;最后裁回原幅
         let clamped = input.clampedToExtent()
@@ -178,7 +249,7 @@ enum AnnotationRenderer {
         filter.setValue(radiusFraction * CGFloat(base.width), forKey: kCIInputRadiusKey)
         guard let output = filter.outputImage?.cropped(to: input.extent) else { return nil }
         guard let result = ciContext.createCGImage(output, from: input.extent) else { return nil }
-        effectCache.setObject(result, forKey: cacheKey)
+        effectCache.setObject(EffectCacheEntry(base: base, image: result), forKey: cacheKey)
         return result
     }
 

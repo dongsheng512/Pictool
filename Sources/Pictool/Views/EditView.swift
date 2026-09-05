@@ -58,6 +58,12 @@ struct EditView: View {
     @State private var colorIndex = 2
     @State private var sizeLevel = 1
     @State private var mosaicEffect: MosaicEffect = .pixelate
+    /// 画笔样式:实线 / 荧光(同一画笔工具的两种笔,不是两个工具)
+    @State private var strokeStyle: StrokeStyleKind = .solid
+    @State private var shapeKind: ShapeKind = .rect
+    @State private var liveShapeTo: CGPoint?
+    @State private var moveStartFrom = CGPoint.zero
+    @State private var moveStartTo = CGPoint.zero
     @State private var livePoints: [CGPoint] = []
     @State private var erasedInGesture = false
     @State private var syncingControls = false
@@ -66,8 +72,13 @@ struct EditView: View {
     @State private var dragStartPoint: CGPoint?
     /// 拖动起点的整笔点位:笔迹移动从手势起点算绝对位移,避免逐帧漂移
     @State private var moveStartPoints: [CGPoint] = []
-    /// 马赛克实时预览重绘节流(≥30ms 一帧)
+    /// 文字角柄改字号(B4):手势起点锚定比例,按对角距比值缩放
+    @State private var textResizing = false
+    @State private var resizeStartFraction: CGFloat = 0
+    @State private var resizeStartDistance: CGFloat = 0
+    /// 实时预览重绘节流(≥30ms 一帧):马赛克画线 / 移动 / 角柄缩放共用,尾帧补齐
     @State private var lastMosaicRebuild = Date.distantPast
+    @State private var overlayRebuildTask: Task<Void, Never>?
     /// 右键菜单 action target 保活(NSMenuItem.target 不持有)
     @State private var contextBoxes: [ContextActionBox] = []
 
@@ -76,6 +87,12 @@ struct EditView: View {
     @State private var draftContent = ""
     @State private var draftEditingID: UUID?
     @FocusState private var draftFocused: Bool
+
+    // 画布视口(缩放/平移,B1)
+    @State private var editZoom: CGFloat = 1
+    @State private var editPan: CGSize = .zero
+    @State private var canvasContainerSize: CGSize = .zero
+    @State private var lastPanTranslation: CGPoint = .zero
 
     // 导出
     @State private var exporting = false
@@ -88,6 +105,8 @@ struct EditView: View {
     @State private var showColorMenu = false
     @State private var showSizeMenu = false
     @State private var showMosaicMenu = false
+    @State private var showStrokeStyleMenu = false
+    @State private var showShapeMenu = false
     @State private var showCropMenu = false
     @State private var showExportPopover = false
     @State private var holdingWindowLock = false
@@ -115,6 +134,7 @@ struct EditView: View {
             }
         }
         .onDisappear {
+            overlayRebuildTask?.cancel()
             if holdingWindowLock {
                 holdingWindowLock = false
                 WindowMoveControl.popEditLock()
@@ -128,18 +148,25 @@ struct EditView: View {
         }
         .onChange(of: annotations) { _, new in
             annotationStore.set(new, for: file.url)
-            rebuildOverlay()
+            scheduleOverlayRebuild()
         }
         .onChange(of: livePoints) { _, _ in
             guard tool == .mosaic else { return }
-            // 每个采集点都全幅重绘太烧 CPU,时间门槛节流;松手提交后由 annotations 变化补最终帧
-            let now = Date()
-            guard now.timeIntervalSince(lastMosaicRebuild) >= 0.03 else { return }
-            lastMosaicRebuild = now
-            rebuildOverlay()
+            scheduleOverlayRebuild()
         }
         .onChange(of: draftFocused) { _, focused in
             store.isTextDraftActive = focused
+        }
+        // 状态栏缩放控件(B1):与浏览模式同一入口
+        .onChange(of: store.editZoomRequest?.token) { _, _ in
+            guard let action = store.editZoomRequest?.action else { return }
+            applyEditZoomAction(action)
+        }
+        .onChange(of: editZoom) { _, newZoom in
+            store.editDisplayScale = newZoom
+        }
+        .onDisappear {
+            store.editDisplayScale = 1
         }
         .onChange(of: selectedID) { _, _ in
             syncControlsFromSelection()
@@ -240,19 +267,18 @@ struct EditView: View {
 
             Spacer()
 
+            // 水印独立入口:纯图标(无边框箭头),高度与颜色/大小 chip 一致;导出弹层里另有勾选项
             Button { showWatermarkSettings.toggle() } label: {
-                if watermarkDraft.enabled && watermarkDraft.hasContent {
-                    styleChip {
-                        Image(systemName: "checkmark.seal.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Color.accentColor)
-                    }
-                } else {
-                    Image(systemName: "seal").frame(width: 22, height: 18)
-                }
+                Image(systemName: watermarkDraft.enabled && watermarkDraft.hasContent
+                        ? "checkmark.seal.fill" : "seal")
+                    .font(.system(size: 12))
+                    .foregroundStyle(watermarkDraft.enabled && watermarkDraft.hasContent
+                                     ? Color.accentColor : Color.primary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("水印")
+            .help("水印设置(画布实时预览,导出时烙进像素)")
             .popover(isPresented: $showWatermarkSettings, arrowEdge: .bottom) {
                 Form {
                     WatermarkSettingsForm(settings: $watermarkDraft)
@@ -261,41 +287,62 @@ struct EditView: View {
                 .frame(width: 360)
             }
 
-            if overwriteFormat != nil {
-                Button("覆盖原图") { export(overwrite: true) }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red.opacity(0.85))
+            Menu {
+                Button("存储为…") {
+                    closeStyleMenus()
+                    showWatermarkSettings = false
+                    showExportPopover = true
+                }
+                if overwriteFormat != nil {
+                    Button("覆盖原图", role: .destructive) {
+                        closeStyleMenus()
+                        showWatermarkSettings = false
+                        export(overwrite: true)
+                    }
                     .disabled(exporting || previewFailed)
-                    .help("把编辑结果写回原文件,原像素不可恢复")
-            }
-
-            Button("退出") { onClose() }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("退出编辑")
-
-            Button {
-                closeStyleMenus()
-                showWatermarkSettings = false
-                showExportPopover.toggle()
+                }
             } label: {
-                if exporting { ProgressView().controlSize(.small) } else { Text("导出…") }
+                Text("导出")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(exportReady ? 1 : 0.65))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        // 与水印 chip 同一几何(12pt 字 + 4pt 垂直内边距),高度天然对齐
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.accentColor.opacity(exportReady ? 1 : 0.4))
+                    )
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .keyboardShortcut(.defaultAction)
+            // 纯按钮外观,点击任意处弹菜单(隐藏系统箭头指示器)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .disabled(exporting || displayPreview == nil || previewFailed)
             .popover(isPresented: $showExportPopover, arrowEdge: .bottom) {
                 ExportOptionsForm(
                     format: $format,
                     includeGPS: $includeGPS,
+                    watermark: $watermarkDraft,
                     exporting: exporting,
                     onExport: {
                         showExportPopover = false
                         export(overwrite: false)
-                    }
+                    },
+                    onWatermarkSettings: { showWatermarkSettings = true }
                 )
             }
+
+            // 退出:叉形图标,置于最右
+            Button { onClose() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 22, height: 18)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("退出编辑 (Esc)")
         }
         .padding(.horizontal, 12)
         .frame(height: 32)
@@ -322,6 +369,16 @@ struct EditView: View {
             .help("颜色")
             .popover(isPresented: $showColorMenu, arrowEdge: .bottom) { colorMenu }
         }
+        if tool == .brush {
+            Button { showStrokeStyleMenu.toggle() } label: {
+                styleChip {
+                    Text(strokeStyle.label).font(.system(size: 11))
+                }
+            }
+            .buttonStyle(.plain)
+            .help("笔样式")
+            .popover(isPresented: $showStrokeStyleMenu, arrowEdge: .bottom) { strokeStyleMenu }
+        }
         if tool == .mosaic {
             Button { showMosaicMenu.toggle() } label: {
                 styleChip {
@@ -331,6 +388,16 @@ struct EditView: View {
             .buttonStyle(.plain)
             .help("效果")
             .popover(isPresented: $showMosaicMenu, arrowEdge: .bottom) { mosaicMenu }
+        }
+        if tool == .shape {
+            Button { showShapeMenu.toggle() } label: {
+                styleChip {
+                    Text(shapeKind.label).font(.system(size: 11))
+                }
+            }
+            .buttonStyle(.plain)
+            .help("形状")
+            .popover(isPresented: $showShapeMenu, arrowEdge: .bottom) { shapeMenu }
         }
         if tool != .eraser && tool != .crop {
             Button { showSizeMenu.toggle() } label: {
@@ -437,6 +504,52 @@ struct EditView: View {
         .padding(10)
     }
 
+    private var strokeStyleMenu: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("笔样式").font(.caption).foregroundStyle(.secondary)
+            ForEach(StrokeStyleKind.allCases) { style in
+                Button {
+                    strokeStyle = style
+                } label: {
+                    HStack {
+                        Text(style.label)
+                        Spacer()
+                        if strokeStyle == style {
+                            Image(systemName: "checkmark").font(.caption)
+                        }
+                    }
+                    .frame(minWidth: 88)
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 3)
+            }
+        }
+        .padding(10)
+    }
+
+    private var shapeMenu: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("形状").font(.caption).foregroundStyle(.secondary)
+            ForEach(ShapeKind.allCases) { kind in
+                Button {
+                    shapeKind = kind
+                } label: {
+                    HStack {
+                        Text(kind.label)
+                        Spacer()
+                        if shapeKind == kind {
+                            Image(systemName: "checkmark").font(.caption)
+                        }
+                    }
+                    .frame(minWidth: 88)
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 3)
+            }
+        }
+        .padding(10)
+    }
+
     private var cropMenu: some View {
         VStack(alignment: .leading, spacing: 12) {
             // 旋转/翻转只在顶栏(唯一入口);这里只放裁切专属的拉直与选区
@@ -508,6 +621,8 @@ struct EditView: View {
         showColorMenu = false
         showSizeMenu = false
         showMosaicMenu = false
+        showStrokeStyleMenu = false
+        showShapeMenu = false
         showCropMenu = false
         showExportPopover = false
     }
@@ -542,7 +657,14 @@ struct EditView: View {
                         colorIndex: colorIndex,
                         sizeLevel: sizeLevel,
                         mosaicEffect: mosaicEffect,
+                        strokeStyle: strokeStyle,
+                        shapeKind: shapeKind,
                         livePoints: livePoints,
+                        liveShapeFrom: tool == .shape ? dragStartPoint : nil,
+                        liveShapeTo: liveShapeTo,
+                        onTextResizeStart: handleTextResizeStart,
+                        onTextResizeChange: handleTextResizeChange,
+                        onTextResizeEnd: handleTextResizeEnd,
                         draftAnchor: draftAnchor,
                         draftContent: $draftContent,
                         draftEditingID: draftEditingID,
@@ -554,11 +676,18 @@ struct EditView: View {
                         onCancel: handleEscape,
                         selection: selection,
                         watermark: liveWatermark,
+                        zoom: editZoom,
+                        pan: editPan,
                         hoverTest: tool == .crop ? nil : { point in
-                            hitTest(at: point, kinds: [.text, .brush, .mosaic]) != nil
+                            hitTest(at: point, kinds: [.text, .brush, .mosaic, .shape]) != nil
                         },
                         baseCursor: tool == .text ? .iBeam : .crosshair,
-                        contextMenuProvider: tool == .crop ? nil : contextMenu(at:)
+                        contextMenuProvider: tool == .crop ? nil : contextMenu(at:),
+                        onScrollGesture: handleCanvasScroll,
+                        onMagnifyGesture: handleCanvasMagnify,
+                        onPanGesture: handleCanvasPan,
+                        onPanGestureEnd: { lastPanTranslation = .zero },
+                        onContainerChange: handleCanvasResize
                     )
                 }
             } else if previewFailed {
@@ -572,11 +701,14 @@ struct EditView: View {
             } else {
                 ProgressView("正在载入原图…")
             }
+
         }
         .frame(maxHeight: .infinity)
+        // 缩放后图片不允许溢出画布区盖住顶栏/底栏
+        .clipped()
     }
 
-    /// 切工具保留选中(对齐预览.app);只清草稿、弹层与手势残状态。
+    /// 切工具保留选中(对齐预览.app);清草稿、弹层与全部手势残状态。
     private func switchTool(_ t: EditTool) {
         guard t != tool else { return }
         cancelDraft()
@@ -586,7 +718,13 @@ struct EditView: View {
         grabOffset = .zero
         dragStartPoint = nil
         moveStartPoints = []
+        livePoints = []
+        liveShapeTo = nil
+        erasedInGesture = false
+        tapCandidate = false
         tool = t
+        // 回写给菜单 C/D 门禁与状态栏(顶栏切换不走 beginEdit 通道)
+        store.editTool = t
     }
 
     /// ⌘Z/⇧⌘Z/⌫/Esc。文字草稿聚焦时撤销与删除让位给文本编辑,Esc 仍取消草稿。
@@ -614,6 +752,19 @@ struct EditView: View {
                 .disabled(draftFocused)
             Button { switchTool(.eraser) } label: { EmptyView() }
                 .keyboardShortcut("e", modifiers: [])
+                .disabled(draftFocused)
+            // ⌘⏎ 直达导出选项面板(融合后的菜单按钮不再有主操作区)
+            Button { showExportPopover = true } label: { EmptyView() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(draftFocused || exporting || displayPreview == nil || previewFailed)
+            Button { resetCanvasViewport() } label: { EmptyView() }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(draftFocused)
+            Button { stepCanvasZoom(1.25) } label: { EmptyView() }
+                .keyboardShortcut("=", modifiers: .command)
+                .disabled(draftFocused)
+            Button { stepCanvasZoom(1 / 1.25) } label: { EmptyView() }
+                .keyboardShortcut("-", modifiers: .command)
                 .disabled(draftFocused)
             Button { nudge(dx: -1, dy: 0) } label: { EmptyView() }
                 .keyboardShortcut(.leftArrow, modifiers: [])
@@ -652,18 +803,21 @@ struct EditView: View {
             break
         case .eraser:
             erase(at: point)
-        case .text, .brush, .mosaic:
-            if let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic]) {
+        case .text, .brush, .mosaic, .shape:
+            if let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic, .shape]) {
                 selectedID = hit
                 selectingExisting = true
                 tapCandidate = false
                 switch annotations.first(where: { $0.id == hit })?.kind {
                 case let .text(anchor, _, _, _):
                     grabOffset = CGSize(width: point.x - anchor.x, height: point.y - anchor.y)
-                case let .stroke(points, _, _):
+                case let .stroke(points, _, _, _):
                     moveStartPoints = points
                 case let .mosaic(points, _, _):
                     moveStartPoints = points
+                case let .shape(_, from, to, _, _):
+                    moveStartFrom = from
+                    moveStartTo = to
                 default:
                     break
                 }
@@ -671,6 +825,8 @@ struct EditView: View {
                 selectNone()
                 if tool == .text {
                     tapCandidate = true
+                } else if tool == .shape {
+                    liveShapeTo = point
                 } else {
                     livePoints = [point]
                 }
@@ -697,6 +853,13 @@ struct EditView: View {
                    abs(point.x - last.x) < 0.0015, abs(point.y - last.y) < 0.0015 { return }
                 livePoints.append(point)
             }
+        case .shape:
+            if selectingExisting {
+                guard !withinTapThreshold(point) else { return }
+                moveSelected(to: point)
+            } else {
+                liveShapeTo = point
+            }
         case .eraser:
             erase(at: point)
         case .text:
@@ -716,6 +879,8 @@ struct EditView: View {
             break
         case .brush, .mosaic:
             if !selectingExisting { commitStroke() }
+        case .shape:
+            if !selectingExisting { commitShape(at: point) }
         case .eraser:
             break
         case .text:
@@ -734,8 +899,20 @@ struct EditView: View {
             moveUndoPushed = false
         }
         livePoints = []
+        liveShapeTo = nil
         selectingExisting = false
         dragStartPoint = nil
+    }
+
+    /// 形状提交:起止距离过小视为误触不成形
+    private func commitShape(at point: CGPoint) {
+        guard let start = dragStartPoint else { return }
+        guard hypot(point.x - start.x, point.y - start.y) >= 0.01 else { return }
+        pushUndo()
+        annotations.append(Annotation(kind: .shape(
+            kind: shapeKind, from: start, to: point, widthLevel: sizeLevel, colorIndex: colorIndex
+        )))
+        selectedID = annotations.last?.id
     }
 
     private func handleEscape() {
@@ -752,7 +929,7 @@ struct EditView: View {
 
     private func contextMenu(at point: CGPoint) -> NSMenu? {
         if draftAnchor != nil { commitDraft() }
-        guard let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic]) else { return nil }
+        guard let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic, .shape]) else { return nil }
         if selectedID != hit { selectedID = hit }
         let menu = NSMenu()
         contextBoxes.removeAll()
@@ -786,19 +963,27 @@ struct EditView: View {
         for annotation in annotations.reversed() {
             guard let kind = kindOf(annotation), kinds.contains(kind) else { continue }
             switch annotation.kind {
-            case let .text(anchor, content, sizeLevel, _):
+            case let .text(anchor, content, sizeFraction, _):
                 let bounds = MarkupGeometry.textHitRect(
-                    anchor: anchor, content: content, sizeLevel: sizeLevel, imageSize: canvasSize
+                    anchor: anchor, content: content, sizeFraction: sizeFraction, imageSize: canvasSize
                 )
                 if bounds.insetBy(dx: -0.006, dy: -0.006).contains(point) { return annotation.id }
-            case let .stroke(points, widthLevel, _):
+            case let .stroke(points, widthLevel, _, style):
                 if MarkupGeometry.stroke(points, contains: point,
-                                         widthFraction: MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel)) {
+                                         widthFraction: MarkPalette.fraction(MarkPalette.widthTable(for: style), level: widthLevel),
+                                         canvasSize: canvasSize) {
                     return annotation.id
                 }
             case let .mosaic(points, widthLevel, _):
                 if MarkupGeometry.stroke(points, contains: point,
-                                         widthFraction: MarkPalette.fraction(MarkPalette.mosaicWidths, level: widthLevel)) {
+                                         widthFraction: MarkPalette.fraction(MarkPalette.mosaicWidths, level: widthLevel),
+                                         canvasSize: canvasSize) {
+                    return annotation.id
+                }
+            case let .shape(kind, from, to, widthLevel, _):
+                if MarkupGeometry.hitShape(kind: kind, from: from, to: to,
+                                           widthFraction: MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel),
+                                           canvasSize: canvasSize, at: point) {
                     return annotation.id
                 }
             }
@@ -808,7 +993,7 @@ struct EditView: View {
 
     private func kindOf(_ annotation: Annotation) -> EditTool? {
         switch annotation.kind {
-        case .text: .text; case .stroke: .brush; case .mosaic: .mosaic
+        case .text: .text; case .stroke: .brush; case .mosaic: .mosaic; case .shape: .shape
         }
     }
 
@@ -816,24 +1001,25 @@ struct EditView: View {
         guard let id = selectedID,
               let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         switch annotations[index].kind {
-        case let .text(anchor, content, sizeLevel, colorIdx):
+        case let .text(anchor, content, sizeFraction, colorIdx):
             // 文字从抓取偏移绝对定位(grabOffset 在手势起点固定),无逐帧漂移
             let target = CGPoint(x: point.x - grabOffset.width, y: point.y - grabOffset.height)
             let next = MarkupGeometry.moved(anchor: target, by: .zero)
             guard next != anchor else { return }
             pushUndoForMoveIfFirst()
             annotations[index].kind = .text(
-                anchor: next, content: content, sizeLevel: sizeLevel, colorIndex: colorIdx
+                anchor: next, content: content, sizeFraction: sizeFraction, colorIndex: colorIdx
             )
-        case let .stroke(_, widthLevel, colorIdx):
+        case let .stroke(_, widthLevel, colorIdx, style):
             guard let start = dragStartPoint else { return }
             let moved = MarkupGeometry.clampedTranslate(
                 points: moveStartPoints,
                 dx: point.x - start.x, dy: point.y - start.y
             )
-            if case let .stroke(current, _, _) = annotations[index].kind, moved == current { return }
+            if case let .stroke(current, _, _, _) = annotations[index].kind, moved == current { return }
             pushUndoForMoveIfFirst()
-            annotations[index].kind = .stroke(points: moved, widthLevel: widthLevel, colorIndex: colorIdx)
+            annotations[index].kind = .stroke(points: moved, widthLevel: widthLevel,
+                                              colorIndex: colorIdx, style: style)
         case let .mosaic(_, widthLevel, effect):
             guard let start = dragStartPoint else { return }
             let moved = MarkupGeometry.clampedTranslate(
@@ -843,6 +1029,17 @@ struct EditView: View {
             if case let .mosaic(current, _, _) = annotations[index].kind, moved == current { return }
             pushUndoForMoveIfFirst()
             annotations[index].kind = .mosaic(points: moved, widthLevel: widthLevel, effect: effect)
+        case let .shape(kind, _, _, widthLevel, colorIdx):
+            guard let start = dragStartPoint else { return }
+            let dx = point.x - start.x, dy = point.y - start.y
+            let moved = MarkupGeometry.clampedTranslate(
+                points: [moveStartFrom, moveStartTo], dx: dx, dy: dy
+            )
+            if case let .shape(_, from, to, _, _) = annotations[index].kind,
+               moved[0] == from, moved[1] == to { return }
+            pushUndoForMoveIfFirst()
+            annotations[index].kind = .shape(kind: kind, from: moved[0], to: moved[1],
+                                             widthLevel: widthLevel, colorIndex: colorIdx)
         }
     }
 
@@ -883,13 +1080,14 @@ struct EditView: View {
         pushUndo()
         if let id = draftEditingID,
            let index = annotations.firstIndex(where: { $0.id == id }),
-           case let .text(_, _, sizeLevel, colorIdx) = annotations[index].kind {
+           case let .text(_, _, sizeFraction, colorIdx) = annotations[index].kind {
             annotations[index].kind = .text(anchor: anchor, content: content,
-                                            sizeLevel: sizeLevel, colorIndex: colorIdx)
+                                            sizeFraction: sizeFraction, colorIndex: colorIdx)
         } else {
             annotations.append(Annotation(kind: .text(
                 anchor: anchor, content: content,
-                sizeLevel: sizeLevel, colorIndex: colorIndex
+                sizeFraction: MarkPalette.fraction(MarkPalette.textSizes, level: sizeLevel),
+                colorIndex: colorIndex
             )))
             selectedID = annotations.last?.id
         }
@@ -916,14 +1114,15 @@ struct EditView: View {
             )))
         default:
             annotations.append(Annotation(kind: .stroke(
-                points: simplified, widthLevel: sizeLevel, colorIndex: colorIndex
+                points: simplified, widthLevel: sizeLevel, colorIndex: colorIndex,
+                style: strokeStyle
             )))
         }
         selectedID = annotations.last?.id
     }
 
     private func erase(at point: CGPoint) {
-        if let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic]) {
+        if let hit = hitTest(at: point, kinds: [.text, .brush, .mosaic, .shape]) {
             if !erasedInGesture {
                 pushUndo()
                 erasedInGesture = true
@@ -940,15 +1139,19 @@ struct EditView: View {
               let annotation = annotations.first(where: { $0.id == id }) else { return }
         syncingControls = true
         switch annotation.kind {
-        case let .text(_, _, sizeLevel, colorIndex):
-            self.sizeLevel = sizeLevel
+        case let .text(_, _, sizeFraction, colorIndex):
+            self.sizeLevel = MarkPalette.nearestTextLevel(sizeFraction)
             self.colorIndex = colorIndex
-        case let .stroke(_, widthLevel, colorIndex):
+        case let .stroke(_, widthLevel, colorIndex, style):
             self.sizeLevel = widthLevel
             self.colorIndex = colorIndex
+            self.strokeStyle = style
         case let .mosaic(_, widthLevel, effect):
             self.sizeLevel = widthLevel
             self.mosaicEffect = effect
+        case let .shape(_, _, _, widthLevel, colorIndex):
+            self.sizeLevel = widthLevel
+            self.colorIndex = colorIndex
         }
         syncingControls = false
     }
@@ -959,19 +1162,25 @@ struct EditView: View {
               let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         switch annotations[index].kind {
         case let .text(anchor, content, old, colorIndex):
-            guard old != sizeLevel else { return }
+            let target = MarkPalette.fraction(MarkPalette.textSizes, level: sizeLevel)
+            guard old != target else { return }
             pushUndo()
             annotations[index].kind = .text(anchor: anchor, content: content,
-                                            sizeLevel: sizeLevel, colorIndex: colorIndex)
-        case let .stroke(points, old, colorIndex):
+                                            sizeFraction: target, colorIndex: colorIndex)
+        case let .stroke(points, old, colorIndex, style):
             guard old != sizeLevel else { return }
             pushUndo()
             annotations[index].kind = .stroke(points: points, widthLevel: sizeLevel,
-                                              colorIndex: colorIndex)
+                                              colorIndex: colorIndex, style: style)
         case let .mosaic(points, old, effect):
             guard old != sizeLevel else { return }
             pushUndo()
             annotations[index].kind = .mosaic(points: points, widthLevel: sizeLevel, effect: effect)
+        case let .shape(kind, from, to, old, colorIndex):
+            guard old != sizeLevel else { return }
+            pushUndo()
+            annotations[index].kind = .shape(kind: kind, from: from, to: to,
+                                             widthLevel: sizeLevel, colorIndex: colorIndex)
         }
     }
 
@@ -981,16 +1190,21 @@ struct EditView: View {
               let id = selectedID,
               let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         switch annotations[index].kind {
-        case let .text(anchor, content, sizeLevel, old):
+        case let .text(anchor, content, sizeFraction, old):
             guard old != newIndex else { return }
             pushUndo()
             annotations[index].kind = .text(anchor: anchor, content: content,
-                                            sizeLevel: sizeLevel, colorIndex: newIndex)
-        case let .stroke(points, widthLevel, old):
+                                            sizeFraction: sizeFraction, colorIndex: newIndex)
+        case let .stroke(points, widthLevel, old, style):
             guard old != newIndex else { return }
             pushUndo()
             annotations[index].kind = .stroke(points: points, widthLevel: widthLevel,
-                                              colorIndex: newIndex)
+                                              colorIndex: newIndex, style: style)
+        case let .shape(kind, from, to, widthLevel, old):
+            guard old != newIndex else { return }
+            pushUndo()
+            annotations[index].kind = .shape(kind: kind, from: from, to: to,
+                                             widthLevel: widthLevel, colorIndex: newIndex)
         case .mosaic:
             break
         }
@@ -1022,6 +1236,7 @@ struct EditView: View {
     private func beginUndoGroup() { pushUndo() }
 
     private func undo() {
+        cancelDraft()
         guard let last = undoStack.popLast() else { return }
         redoStack.append(currentSnapshot())
         applySnapshot(last)
@@ -1029,6 +1244,7 @@ struct EditView: View {
     }
 
     private func redo() {
+        cancelDraft()
         guard let next = redoStack.popLast() else { return }
         undoStack.append(currentSnapshot())
         applySnapshot(next)
@@ -1073,7 +1289,12 @@ struct EditView: View {
         CropFormat.exactSourceExt(file.url.pathExtension)
     }
 
+    private var exportReady: Bool {
+        !exporting && displayPreview != nil && !previewFailed
+    }
+
     private func rotate(cw: Bool) {
+        cancelDraft()
         pushUndo()
         let map: (CGPoint) -> CGPoint = cw ? MarkupGeometry.rotateCW90 : MarkupGeometry.rotateCCW90
         annotations = annotations.map { MarkupGeometry.mapped($0, map) }
@@ -1082,6 +1303,7 @@ struct EditView: View {
     }
 
     private func toggleFlipH() {
+        cancelDraft()
         pushUndo()
         annotations = annotations.map { MarkupGeometry.mapped($0, MarkupGeometry.flipH) }
         flipH.toggle()
@@ -1089,6 +1311,7 @@ struct EditView: View {
     }
 
     private func toggleFlipV() {
+        cancelDraft()
         pushUndo()
         annotations = annotations.map { MarkupGeometry.mapped($0, MarkupGeometry.flipV) }
         flipV.toggle()
@@ -1116,27 +1339,149 @@ struct EditView: View {
               let index = annotations.firstIndex(where: { $0.id == id }) else { return }
         let delta = CGSize(width: dx * 0.002, height: dy * 0.002)
         switch annotations[index].kind {
-        case let .text(anchor, content, sizeLevel, colorIdx):
+        case let .text(anchor, content, sizeFraction, colorIdx):
             let next = MarkupGeometry.moved(anchor: anchor, by: delta)
             guard next != anchor else { return }
             pushUndo()
             annotations[index].kind = .text(anchor: next, content: content,
-                                            sizeLevel: sizeLevel, colorIndex: colorIdx)
-        case let .stroke(points, widthLevel, colorIdx):
+                                            sizeFraction: sizeFraction, colorIndex: colorIdx)
+        case let .stroke(points, widthLevel, colorIdx, style):
             let next = MarkupGeometry.clampedTranslate(points: points, dx: delta.width, dy: delta.height)
             guard next != points else { return }
             pushUndo()
-            annotations[index].kind = .stroke(points: next, widthLevel: widthLevel, colorIndex: colorIdx)
+            annotations[index].kind = .stroke(points: next, widthLevel: widthLevel,
+                                              colorIndex: colorIdx, style: style)
         case let .mosaic(points, widthLevel, effect):
             let next = MarkupGeometry.clampedTranslate(points: points, dx: delta.width, dy: delta.height)
             guard next != points else { return }
             pushUndo()
             annotations[index].kind = .mosaic(points: next, widthLevel: widthLevel, effect: effect)
+        case let .shape(kind, from, to, widthLevel, colorIdx):
+            let next = MarkupGeometry.clampedTranslate(points: [from, to], dx: delta.width, dy: delta.height)
+            guard next[0] != from || next[1] != to else { return }
+            pushUndo()
+            annotations[index].kind = .shape(kind: kind, from: next[0], to: next[1],
+                                             widthLevel: widthLevel, colorIndex: colorIdx)
         }
     }
 
-    private func swapRatio() {
-        guard ratio.supportsSwap else { return }
+    // MARK: 画布视口(缩放/平移)
+
+    private var canvasImageAspect: CGFloat {
+        transformedPixelSize.height > 0 ? transformedPixelSize.width / transformedPixelSize.height : 1
+    }
+
+    /// 滚轮:⌘ = 缩放(锚点视口中心由 MarkupCanvas 传容器后取中心),否则平移(方向随手指)。
+    private func handleCanvasScroll(dx: CGFloat, dy: CGFloat, command: Bool, container: CGSize) {
+        guard tool != .crop, displayPreview != nil, container.width > 0 else { return }
+        if command {
+            let factor = exp(-max(-60, min(60, dy)) * 0.01)
+            applyCanvasZoom(factor: factor, anchor: CGPoint(x: container.width / 2, y: container.height / 2),
+                            container: container)
+        } else {
+            editPan = EditCanvasMath.panned(pan: editPan, delta: CGSize(width: dx, height: dy),
+                                            container: container, imageAspect: canvasImageAspect,
+                                            zoom: editZoom)
+        }
+    }
+
+    private func handleCanvasMagnify(factor: CGFloat, anchor: CGPoint, container: CGSize) {
+        guard tool != .crop, displayPreview != nil else { return }
+        applyCanvasZoom(factor: factor, anchor: anchor, container: container)
+    }
+
+    private func handleCanvasPan(translation: CGPoint, container: CGSize) {
+        guard tool != .crop, displayPreview != nil else { return }
+        let delta = CGSize(width: translation.x - lastPanTranslation.x,
+                           height: translation.y - lastPanTranslation.y)
+        lastPanTranslation = translation
+        editPan = EditCanvasMath.panned(pan: editPan, delta: delta,
+                                        container: container, imageAspect: canvasImageAspect,
+                                        zoom: editZoom)
+    }
+
+    private func applyCanvasZoom(factor: CGFloat, anchor: CGPoint, container: CGSize) {
+        let result = EditCanvasMath.zoomed(zoom: editZoom, pan: editPan, factor: factor,
+                                           anchor: anchor, container: container,
+                                           imageAspect: canvasImageAspect)
+        editZoom = result.zoom
+        editPan = result.pan
+    }
+
+    /// 窗口 resize:原视口中心处的内容点仍保持在新容器中心
+    private func handleCanvasResize(_ newSize: CGSize) {
+        let old = canvasContainerSize
+        canvasContainerSize = newSize
+        guard tool != .crop, displayPreview != nil, old.width > 0, old.height > 0,
+              newSize.width > 0, newSize.height > 0, old != newSize else { return }
+        let oldRect = EditCanvasMath.viewRect(container: old, imageAspect: canvasImageAspect,
+                                              zoom: editZoom, pan: editPan)
+        guard oldRect.width > 0, oldRect.height > 0 else { return }
+        let u = (old.width / 2 - oldRect.minX) / oldRect.width
+        let v = (old.height / 2 - oldRect.minY) / oldRect.height
+        editPan = EditCanvasMath.panForCenteredContent(u: u, v: v, zoom: editZoom,
+                                                       container: newSize,
+                                                       imageAspect: canvasImageAspect)
+    }
+
+    private func resetCanvasViewport() {
+        editZoom = 1
+        editPan = .zero
+    }
+
+    /// 状态栏下拉的动作:适配窗口 / 倍率预设(相对适应窗口,居中)
+    private func applyEditZoomAction(_ action: ZoomAction) {
+        guard tool != .crop, displayPreview != nil else { return }
+        switch action {
+        case .fit, .actualSize:
+            resetCanvasViewport()
+        case .scale(let factor):
+            editZoom = EditCanvasMath.clampedZoom(factor)
+            editPan = .zero
+        case .zoomIn:
+            stepCanvasZoom(1.25)
+        case .zoomOut:
+            stepCanvasZoom(1 / 1.25)
+        }
+    }
+
+    // MARK: 文字角柄改字号
+
+    private func handleTextResizeStart(at point: CGPoint) {
+        guard let id = selectedID,
+              case let .text(anchor, _, fraction, _) = annotations.first(where: { $0.id == id })?.kind
+        else { return }
+        textResizing = true
+        resizeStartFraction = MarkPalette.clampTextFraction(fraction)
+        resizeStartDistance = max(0.02, hypot(point.x - anchor.x, point.y - anchor.y))
+        moveUndoPushed = false
+    }
+
+    private func handleTextResizeChange(at point: CGPoint) {
+        guard textResizing, let id = selectedID,
+              let index = annotations.firstIndex(where: { $0.id == id }),
+              case let .text(anchor, content, _, colorIdx) = annotations[index].kind else { return }
+        let dist = max(0.02, hypot(point.x - anchor.x, point.y - anchor.y))
+        let fraction = MarkPalette.clampTextFraction(resizeStartFraction * dist / resizeStartDistance)
+        if case let .text(_, _, current, _) = annotations[index].kind, current == fraction { return }
+        pushUndoForMoveIfFirst()
+        annotations[index].kind = .text(anchor: anchor, content: content,
+                                        sizeFraction: fraction, colorIndex: colorIdx)
+    }
+
+    private func handleTextResizeEnd() {
+        textResizing = false
+    }
+
+    private func stepCanvasZoom(_ factor: CGFloat) {
+        guard canvasContainerSize.width > 0 else { return }
+        applyCanvasZoom(factor: factor,
+                        anchor: CGPoint(x: canvasContainerSize.width / 2,
+                                        y: canvasContainerSize.height / 2),
+                        container: canvasContainerSize)
+    }
+
+    private func swapRatio() {        guard ratio.supportsSwap else { return }
         if ratio == .custom {
             let w = customW; customW = customH; customH = w
         } else if let pair = ratio.labelPair {
@@ -1214,6 +1559,23 @@ struct EditView: View {
             )))
         }
         return result
+    }
+
+    /// 时间门槛节流 + 尾帧补齐:拖拽中的高频标注变化 ≥30ms 才全幅重绘一次,松手后的最终帧必达
+    private func scheduleOverlayRebuild() {
+        let now = Date()
+        guard now.timeIntervalSince(lastMosaicRebuild) >= 0.03 else {
+            overlayRebuildTask?.cancel()
+            overlayRebuildTask = Task {
+                try? await Task.sleep(for: .milliseconds(40))
+                guard !Task.isCancelled else { return }
+                lastMosaicRebuild = Date()
+                rebuildOverlay()
+            }
+            return
+        }
+        lastMosaicRebuild = now
+        rebuildOverlay()
     }
 
     private func rebuildOverlay() {
@@ -1348,8 +1710,10 @@ private final class ContextActionBox: NSObject {
 private struct ExportOptionsForm: View {
     @Binding var format: CropFormat
     @Binding var includeGPS: Bool
+    @Binding var watermark: WatermarkSettings
     var exporting: Bool
     var onExport: () -> Void
+    var onWatermarkSettings: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1380,6 +1744,23 @@ private struct ExportOptionsForm: View {
                         .labelsHidden()
                         .help("关闭后导出文件不带 GPS 坐标,EXIF 其余部分保留")
                 }
+                HStack {
+                    Text("水印")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Toggle("启用水印", isOn: $watermark.enabled)
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .labelsHidden()
+                        .disabled(!watermark.hasContent)
+                        .help(watermark.hasContent ? "导出时把水印烙进像素(画布已实时预览)"
+                              : "先在「设置…」里配置水印文字或 Logo")
+                    Button("设置…") { onWatermarkSettings() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .controlSize(.small)
+                }
             }
 
             Button(action: onExport) {
@@ -1392,7 +1773,7 @@ private struct ExportOptionsForm: View {
             .disabled(exporting)
         }
         .padding(12)
-        .frame(width: 176)
+        .frame(width: 190)
     }
 }
 
@@ -1408,7 +1789,16 @@ private struct MarkupCanvas: View {
     let colorIndex: Int
     let sizeLevel: Int
     let mosaicEffect: MosaicEffect
+    let strokeStyle: StrokeStyleKind
+    let shapeKind: ShapeKind
     let livePoints: [CGPoint]
+    /// 形状实时预览:起点取自按下的 dragStartPoint,终点随手更新
+    var liveShapeFrom: CGPoint?
+    var liveShapeTo: CGPoint?
+    /// 文字角柄改字号(B4):归一化坐标进出
+    var onTextResizeStart: ((CGPoint) -> Void)?
+    var onTextResizeChange: ((CGPoint) -> Void)?
+    var onTextResizeEnd: (() -> Void)?
     let draftAnchor: CGPoint?
     @Binding var draftContent: String
     let draftEditingID: UUID?
@@ -1420,16 +1810,27 @@ private struct MarkupCanvas: View {
     let onCancel: () -> Void
     var selection: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     var watermark: WatermarkSettings = WatermarkSettings()
+    /// 视口缩放/平移(EditView 持有,裁切切换不销毁)
+    var zoom: CGFloat = 1
+    var pan: CGSize = .zero
     /// 悬停命中(归一化坐标进出);nil 表示无悬停手型提示
     var hoverTest: ((CGPoint) -> Bool)?
     /// 按工具的常规光标
     var baseCursor: NSCursor = .arrow
     /// 右键菜单(归一化坐标进出);nil 表示无
     var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+    /// 滚轮/捏合/空格拖(dx, dy, ⌘, 容器尺寸)等,容器尺寸由画布回传
+    var onScrollGesture: ((_ dx: CGFloat, _ dy: CGFloat, _ command: Bool, _ container: CGSize) -> Void)?
+    var onMagnifyGesture: ((_ factor: CGFloat, _ anchor: CGPoint, _ container: CGSize) -> Void)?
+    var onPanGesture: ((_ translation: CGPoint, _ container: CGSize) -> Void)?
+    var onPanGestureEnd: (() -> Void)?
+    var onContainerChange: ((CGSize) -> Void)?
 
     var body: some View {
         GeometryReader { geo in
-            let fit = fittedRect(geo.size)
+            let aspect = image.size.width / max(1, image.size.height)
+            let fit = EditCanvasMath.viewRect(container: geo.size, imageAspect: aspect,
+                                              zoom: zoom, pan: pan)
             let cropBox = CGRect(
                 x: fit.minX + selection.minX * fit.width,
                 y: fit.minY + selection.minY * fit.height,
@@ -1460,6 +1861,10 @@ private struct MarkupCanvas: View {
                     liveStrokePath(fit: fit)
                 }
 
+                if tool == .shape, let from = liveShapeFrom, let to = liveShapeTo {
+                    liveShapePath(kind: shapeKind, from: from, to: to, fit: fit)
+                }
+
                 CanvasMouseCatcher(
                     onDown: { point in pointerDown(point, fit: fit) },
                     onDrag: { point in pointerDrag(point, fit: fit) },
@@ -1475,7 +1880,19 @@ private struct MarkupCanvas: View {
                             guard fit.contains(screenPoint) else { return nil }
                             return provider(normalized(screenPoint, fit))
                         }
-                    }
+                    },
+                    onScroll: { dx, dy, command in
+                        onScrollGesture?(dx, dy, command, geo.size)
+                    },
+                    onMagnify: { factor, anchor in
+                        onMagnifyGesture?(factor, anchor, geo.size)
+                    },
+                    onPanStart: { },
+                    onPanChange: { translation in
+                        onPanGesture?(translation, geo.size)
+                    },
+                    onPanEnd: { onPanGestureEnd?() },
+                    spacePanEnabled: !draftFocused.wrappedValue
                 )
                 .frame(width: geo.size.width, height: geo.size.height)
 
@@ -1485,18 +1902,12 @@ private struct MarkupCanvas: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .onAppear { onContainerChange?(geo.size) }
+            .onChange(of: geo.size) { _, newSize in
+                onContainerChange?(newSize)
+            }
             .onExitCommand { onCancel() }
         }
-    }
-
-    private func fittedRect(_ container: CGSize) -> CGRect {
-        let aspect = image.size.width / max(1, image.size.height)
-        let scale = min(container.width / aspect, container.height)
-        let width = aspect * scale
-        let height = scale
-        return CGRect(x: (container.width - width) / 2,
-                      y: (container.height - height) / 2,
-                      width: width, height: height)
     }
 
     private func normalized(_ location: CGPoint, _ fit: CGRect) -> CGPoint {
@@ -1506,8 +1917,16 @@ private struct MarkupCanvas: View {
         )
     }
 
+    /// 角柄拖拽专用:不夹取,允许在手柄超出 fit 边缘时仍能按真实距离算字号
+    private func normalizedUnclamped(_ location: CGPoint, _ fit: CGRect) -> CGPoint {
+        CGPoint(x: (location.x - fit.minX) / fit.width,
+                y: (location.y - fit.minY) / fit.height)
+    }
+
     @State private var dragStarted = false
     @State private var lastPointer = CGPoint.zero
+    /// 角柄拖拽路由:按下时命中手柄则本次手势全部走 resize 回调
+    @State private var resizeRouting = false
     /// 草稿期间发生过任何按键(含 IME 组合):占位文字退场,避免与候选预览重叠
     @State private var draftInteracted = false
 
@@ -1518,34 +1937,115 @@ private struct MarkupCanvas: View {
             return
         }
         dragStarted = true
+        if textResizeHandleHit(fit: fit, at: point) {
+            resizeRouting = true
+            onTextResizeStart?(normalizedUnclamped(point, fit))
+            return
+        }
         onDragStart(normalized(point, fit))
     }
 
     private func pointerDrag(_ point: CGPoint, fit: CGRect) {
         lastPointer = point
         guard dragStarted else { return }
-        onDragChange(normalized(point, fit))
+        let normalizedPoint = normalized(point, fit)
+        if resizeRouting {
+            onTextResizeChange?(normalizedUnclamped(point, fit))
+        } else {
+            onDragChange(normalizedPoint)
+        }
     }
 
     private func pointerUp(fit: CGRect) {
         if dragStarted {
-            onDragEnd(normalized(lastPointer, fit))
+            let normalizedPoint = normalized(lastPointer, fit)
+            if resizeRouting {
+                onTextResizeChange?(normalizedUnclamped(lastPointer, fit))
+                onTextResizeEnd?()
+                resizeRouting = false
+            } else {
+                onDragEnd(normalizedPoint)
+            }
         }
         dragStarted = false
+    }
+
+    /// 选中文字时右下角手柄(容器坐标 ~9pt,不随缩放);命中半径 12pt
+    private func textResizeHandleHit(fit: CGRect, at point: CGPoint) -> Bool {
+        guard selectedIsText, let bounds = selectionBounds(fit: fit) else { return false }
+        let center = CGPoint(x: bounds.maxX + 4.5, y: bounds.maxY + 4.5)
+        return hypot(point.x - center.x, point.y - center.y) <= 12
+    }
+
+    private var selectedIsText: Bool {
+        guard let id = selectedID,
+              let annotation = annotations.first(where: { $0.id == id }) else { return false }
+        if case .text = annotation.kind { return true }
+        return false
+    }
+
+    /// 形状实时预览(SwiftUI Path,不进 overlay 重绘管线)
+    private func liveShapePath(kind: ShapeKind, from: CGPoint, to: CGPoint, fit: CGRect) -> some View {
+        func point(_ p: CGPoint) -> CGPoint {
+            CGPoint(x: fit.minX + p.x * fit.width, y: fit.minY + p.y * fit.height)
+        }
+        func rect(_ r: CGRect) -> CGRect {
+            CGRect(x: fit.minX + r.minX * fit.width, y: fit.minY + r.minY * fit.height,
+                   width: r.width * fit.width, height: r.height * fit.height)
+        }
+        let widthFraction = MarkPalette.fraction(MarkPalette.strokeWidths, level: sizeLevel)
+        let width = max(1, widthFraction * fit.width)
+        let color = Color(nsColor: MarkPalette.color(colorIndex))
+        let style = StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round)
+        let canvas = CGSize(width: fit.width, height: fit.height)
+        return Group {
+            switch kind {
+            case .rect:
+                Path(rect(MarkupGeometry.standardizedRect(from: from, to: to))).stroke(color, style: style)
+            case .ellipse:
+                Path(ellipseIn: rect(MarkupGeometry.standardizedRect(from: from, to: to)))
+                    .stroke(color, style: style)
+            case .line, .arrow:
+                Path { path in
+                    path.move(to: point(from))
+                    path.addLine(to: point(to))
+                }
+                .stroke(color, style: style)
+                .overlay {
+                    if kind == .arrow,
+                       let head = MarkupGeometry.arrowHead(from: from, to: to,
+                                                           widthFraction: widthFraction,
+                                                           canvasSize: canvas) {
+                        // 头部实心,与提交后的渲染一致
+                        Path { path in
+                            path.move(to: point(head.tip))
+                            path.addLine(to: point(head.baseA))
+                            path.addLine(to: point(head.baseB))
+                            path.closeSubpath()
+                        }
+                        .fill(color)
+                    }
+                }
+            }
+        }
+        .allowsHitTesting(false)
     }
 
     private func liveStrokePath(fit: CGRect) -> some View {
         let points = livePoints.map { p in
             CGPoint(x: fit.minX + p.x * fit.width, y: fit.minY + p.y * fit.height)
         }
-        let widthFraction = MarkPalette.fraction(MarkPalette.strokeWidths, level: sizeLevel)
+        // 画笔样式:荧光 = 宽表 + 45% alpha,与导出渲染同一规则
+        let style = strokeStyle
+        let widthFraction = MarkPalette.fraction(MarkPalette.widthTable(for: style), level: sizeLevel)
         return Path { path in
             guard let first = points.first else { return }
             path.move(to: first)
             for p in points.dropFirst() { path.addLine(to: p) }
         }
         .stroke(
-            Color(nsColor: MarkPalette.color(colorIndex)),
+            Color(nsColor: MarkPalette.color(colorIndex))
+                .opacity(style == .highlighter ? 0.45 : 1),
             style: StrokeStyle(lineWidth: max(1, widthFraction * fit.width),
                                lineCap: .round, lineJoin: .round)
         )
@@ -1558,17 +2058,23 @@ private struct MarkupCanvas: View {
         let imageSize = image.size
         let normalizedBounds: CGRect?
         switch annotation.kind {
-        case let .text(anchor, content, sizeLevel, _):
+        case let .text(anchor, content, sizeFraction, _):
             normalizedBounds = MarkupGeometry.textHitRect(
-                anchor: anchor, content: content, sizeLevel: sizeLevel, imageSize: imageSize
+                anchor: anchor, content: content, sizeFraction: sizeFraction, imageSize: imageSize
             )
-        case let .stroke(points, widthLevel, _):
+        case let .stroke(points, widthLevel, _, style):
             normalizedBounds = MarkupGeometry.strokeBounds(
-                points, widthFraction: MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel)
+                points, widthFraction: MarkPalette.fraction(MarkPalette.widthTable(for: style), level: widthLevel)
             )
         case let .mosaic(points, widthLevel, _):
             normalizedBounds = MarkupGeometry.strokeBounds(
                 points, widthFraction: MarkPalette.fraction(MarkPalette.mosaicWidths, level: widthLevel)
+            )
+        case let .shape(kind, from, to, widthLevel, _):
+            normalizedBounds = MarkupGeometry.shapeBounds(
+                kind: kind, from: from, to: to,
+                widthFraction: MarkPalette.fraction(MarkPalette.strokeWidths, level: widthLevel),
+                canvasSize: imageSize
             )
         }
         guard let b = normalizedBounds else { return nil }
@@ -1590,6 +2096,20 @@ private struct MarkupCanvas: View {
             }
             .frame(width: bounds.width, height: bounds.height)
             .position(x: bounds.midX, y: bounds.midY)
+            .overlay(alignment: .bottomTrailing) {
+                // 文字角柄:拖拽改字号(容器坐标恒定尺寸)
+                if selectedIsText {
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(Color.white)
+                        .frame(width: 9, height: 9)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                .strokeBorder(Color.black.opacity(0.55), lineWidth: 0.5)
+                        )
+                        .shadow(radius: 1)
+                        .offset(x: 4.5, y: 4.5)
+                }
+            }
             .allowsHitTesting(false)
         }
     }

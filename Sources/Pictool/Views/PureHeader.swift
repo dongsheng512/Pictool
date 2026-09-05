@@ -11,40 +11,18 @@ struct PureHeader: View {
     @AppStorage(SidebarTopStyle.storageKey) private var sidebarTopStyle = SidebarTopStyle.defaultValue
     @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
 
-    private var splitsSidebarTop: Bool {
-        sidebarWidth != nil && sidebarTopStyle == .followSidebar
-    }
-
     private var mainHeaderColorScheme: ColorScheme {
         ChromeTheme.colorScheme(for: canvasBackground)
     }
 
     var body: some View {
-        Group {
-            if splitsSidebarTop, let width = sidebarWidth {
-                HStack(spacing: 0) {
-                    leftCluster
-                        .padding(.leading, 12)
-                        .frame(width: width, alignment: .leading)
-                        .clipped()
-                        // 左段(侧栏开关/标题)与右段一样跟随画布背景明暗,
-                        // 黑画布下用亮色,否则黑底黑字看不清
-                        .environment(\.colorScheme, mainHeaderColorScheme)
-                    rightCluster
-                        .padding(.horizontal, 12)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .environment(\.colorScheme, mainHeaderColorScheme)
-                }
-            } else {
-                HStack(spacing: 5) {
-                    leftCluster
-                    Spacer()
-                    rightCluster
-                }
-                .padding(.horizontal, 12)
-                .environment(\.colorScheme, mainHeaderColorScheme)
-            }
+        HStack(spacing: 5) {
+            leftCluster
+            Spacer()
+            rightCluster
         }
+        .padding(.horizontal, 12)
+        .environment(\.colorScheme, mainHeaderColorScheme)
         .frame(height: 32)
         .frame(maxWidth: .infinity)
         // 拖拽区必须与背景同层且在其之上:分成两个 .background 时后挂的那层在更底下,
@@ -67,18 +45,20 @@ struct PureHeader: View {
                     .onTapGesture(count: 2) { NSApp.keyWindow?.zoom(nil) }
             }
         }
+        // 与下方侧栏同一曲线同一触发:材质分界线与侧栏边缘是同一条竖缝,锁步移动
+        .animation(.easeInOut(duration: 0.22), value: store.sidebarVisible)
     }
 
     @ViewBuilder
     private var headerBackground: some View {
-        if splitsSidebarTop, let width = sidebarWidth {
-            HStack(spacing: 0) {
-                SidebarTopBackground()
-                    .frame(width: width)
-                mainHeaderBackground
-            }
-        } else {
+        ZStack(alignment: .leading) {
             mainHeaderBackground
+            if sidebarTopStyle == .followSidebar, let width = sidebarWidth {
+                // 宽度连续伸缩(而非可见性二值切换),与侧栏列宽动画完全同步
+                SidebarTopBackground()
+                    .frame(width: store.sidebarVisible ? width : 0)
+                    .clipped()
+            }
         }
     }
 

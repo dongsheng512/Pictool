@@ -12,7 +12,7 @@
 | `Sources/Pictool/Models/MarkupAnnotation.swift` | `Annotation` / `MosaicEffect` / `MarkPalette` / `MarkupGeometry` |
 | `Sources/Pictool/Models/AnnotationStore.swift` | 进程内 `[URL: [Annotation]]` |
 | `Sources/Pictool/Services/AnnotationRenderer.swift` | CoreText/CG 绘制,预览与导出同一 `draw` |
-| `Sources/Pictool/Services/MarkupService.swift` | 标记导出(旋转 + GPS 开关) |
+| `Sources/Pictool/Services/MarkupService.swift` | 已删除(0.6.13 清理死代码):实际烙印导出走 `CropService.encode` |
 | `Sources/Pictool/Services/WatermarkService.swift` | `WatermarkSettings` / `WatermarkLayout` / `WatermarkRenderer` |
 | `Sources/Pictool/Views/MarkupView.swift` | 标记 sheet |
 

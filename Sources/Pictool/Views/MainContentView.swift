@@ -241,7 +241,8 @@ struct MainContentView: View {
                                     if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
                                 }
                         }
-                        .transition(.move(edge: .leading).combined(with: .opacity))
+                        // 磨砂材质不做透明度动画(半透明会透出画布),Finder 同款纯滑动
+                        .transition(.move(edge: .leading))
                 }
                 detail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -250,7 +251,10 @@ struct MainContentView: View {
                     }
             }
             .padding(.top, 32)
-            PureHeader(sidebarWidth: store.sidebarVisible ? sidebarWidth : nil)
+            // 侧栏收放动画:transition 早已写好(滑入+淡入),此前缺动画通道导致单帧硬切;
+            // 只绑 sidebarVisible,分隔线拖拽宽度的即时性不受影响
+            .animation(.easeInOut(duration: 0.22), value: store.sidebarVisible)
+            PureHeader(sidebarWidth: sidebarWidth)
                 .frame(maxWidth: .infinity, alignment: .top)
         }
         .ignoresSafeArea(edges: .top)
@@ -495,12 +499,7 @@ struct MainContentView: View {
                         .controlSize(.mini)
                 }
                 Spacer()
-                if store.isEditing {
-                    Text("适应窗口")
-                        .foregroundStyle(.tertiary)
-                } else {
-                    zoomMenu
-                }
+                zoomMenu
             } else {
                 Text("未打开图片").foregroundStyle(.secondary)
                 Spacer()
@@ -546,31 +545,36 @@ struct MainContentView: View {
         Button {
             showZoomMenu.toggle()
         } label: {
-            Text("\(Int((store.displayScale * 100).rounded()))%")
+            Text("\(Int(((store.isEditing ? store.editDisplayScale : store.displayScale) * 100).rounded()))%")
                 .font(.caption)
                 .monospacedDigit()
                 .frame(minWidth: 56, alignment: .trailing)
         }
         .buttonStyle(.plain)
-        .disabled(store.currentImage == nil)
+        .disabled(store.currentImage == nil || (store.isEditing && store.editTool == .crop))
     }
 
     /// 窗口内下拉面板(替代 NSMenu 弹出,不超出窗口边界)
     private var zoomDropdown: some View {
+        // 编辑画布的倍率相对适应窗口(1.0 = fit),没有"实际大小"语义
         VStack(alignment: .leading, spacing: 2) {
             ZoomMenuItem("适配窗口") {
                 showZoomMenu = false
-                store.requestZoom(.fit)
+                if store.isEditing { store.requestEditZoom(.fit) } else { store.requestZoom(.fit) }
             }
-            ZoomMenuItem("实际大小 (100%)") {
-                showZoomMenu = false
-                store.requestZoom(.actualSize)
+            if !store.isEditing {
+                ZoomMenuItem("实际大小 (100%)") {
+                    showZoomMenu = false
+                    store.requestZoom(.actualSize)
+                }
             }
             Divider().padding(.vertical, 2)
-            ForEach([0.5, 1.0, 2.0], id: \.self) { factor in
-                ZoomMenuItem("\(Int((factor * 100).rounded()))%") {
-                    showZoomMenu = false
-                    store.requestZoom(.scale(factor))
+            ForEach([0.5, 1.0, 2.0, 4.0], id: \.self) { factor in
+                if store.isEditing || factor != 4.0 {
+                    ZoomMenuItem("\(Int((factor * 100).rounded()))%") {
+                        showZoomMenu = false
+                        if store.isEditing { store.requestEditZoom(.scale(factor)) } else { store.requestZoom(.scale(factor)) }
+                    }
                 }
             }
         }

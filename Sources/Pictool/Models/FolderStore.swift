@@ -135,8 +135,9 @@ final class FolderStore {
     private(set) var cropRequestToken = 0
     private(set) var markupRequestToken = 0
     private(set) var editRequestToken = 0
-    /// 打开统一编辑 sheet 时停在哪一档工具(`C` 裁切 / `D` 文字)
-    private(set) var editTool: EditTool = .text
+    /// 打开统一编辑 sheet 时停在哪一档工具(`C` 裁切 / `D` 文字);
+    /// 编辑器顶栏切换时回写,供菜单 C/D 门禁与状态栏使用
+    var editTool: EditTool = .text
     /// 当前图累计显示旋转次数(每格 90°;显示层状态,不写回文件)。
     /// 传次数而不是递增 token:纯净模式/普通模式是两个画布实例,切换时新画布
     /// 按「次数 - 已应用次数」补齐差值,才能重放完整角度(token 只能重放一刀)。
@@ -218,6 +219,16 @@ final class FolderStore {
 
     /// 缩放指令通道(token 递增表示新指令)
     private(set) var zoomRequest: (action: ZoomAction, token: Int)?
+    /// 编辑画布缩放通道:状态栏下发请求,EditView 回报当前倍率(1.0 = 适应窗口)
+    private(set) var editZoomRequest: (action: ZoomAction, token: Int)?
+    var editDisplayScale: CGFloat = 1
+    private var editZoomToken = 0
+
+    func requestEditZoom(_ action: ZoomAction) {
+        guard isEditing else { return }
+        editZoomToken += 1
+        editZoomRequest = (action, editZoomToken)
+    }
     private var zoomToken = 0
 
     /// folder -> 上次选中的图片,切回文件夹时恢复（key 已 standardized）
@@ -709,6 +720,8 @@ final class FolderStore {
         guard wasSelected else { return }
         if images.isEmpty {
             selectedImageID = nil
+            // 编辑中删掉最后一张图:必须退出编辑态,否则 isModalPresented 卡死全部门禁
+            if isEditing { endEditing() }
         } else {
             selectImage(images[min(index, images.count - 1)].id)
         }

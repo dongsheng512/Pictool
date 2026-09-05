@@ -9,8 +9,9 @@ struct SidebarView: View {
     @AppStorage(CanvasBackground.storageKey) private var canvasBackground = CanvasBackground.defaultValue
     private var sidebarScheme: ColorScheme { ChromeTheme.colorScheme(for: canvasBackground) }
     @State private var expandedIDs: Set<FolderNode.ID> = []
-    /// 缩略图区是否向上扩展(压缩文件夹树高度);再点一次复原
-    @State private var thumbnailsExpanded = false
+    /// 缩略图区是否向上扩展(压缩文件夹树高度);再点一次复原。
+    /// 打开/切换文件夹后默认展开,手动复原后不再被打断(直到下次切文件夹)
+    @State private var thumbnailsExpanded = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,6 +24,9 @@ struct SidebarView: View {
             }
         }
         .animation(.easeInOut(duration: 0.22), value: thumbnailsExpanded)
+        .onChange(of: store.selectedFolderID) { _, _ in
+            thumbnailsExpanded = true
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             ZStack {

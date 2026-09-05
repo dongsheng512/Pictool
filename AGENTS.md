@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Pictool(PureView):macOS 图片查看器(Swift 6 + SwiftUI 混合 AppKit)。主要功能已实现(浏览/信息/裁切/打印/偏好设置),`PLAN.md` 是总体规格来源(模块划分、里程碑 M0–M6、技术决策都在里面),动手前先读。**文字标记/水印/画笔/马赛克**的唯一执行规格是 `MARKUP_PLAN.md`(期号 A1–A4,不要和 PLAN.md 的 M1–M6 混用);实现 agent 先读该文件第 0 节再写代码。**编辑器交互升级(现有功能打磨 B0 / 画布缩放 / 形状工具 / 顶栏收敛 / 文字角柄+荧光笔)**的唯一执行规格是 `EDIT_UX_PLAN.md`(期号 B0–B4;B0 已落地,B1–B4 规划中,实现 B1 前先读其第 0 节)。选型与竞品的调研依据存档在 `RESEARCH.md`(仅参考,非规格)。以下是其中最易被违反的硬约束。
+Pictool(PureView):macOS 图片查看器(Swift 6 + SwiftUI 混合 AppKit)。主要功能已实现(浏览/信息/裁切/打印/偏好设置),`PLAN.md` 是总体规格来源(模块划分、里程碑 M0–M6、技术决策都在里面),动手前先读。**文字标记/水印/画笔/马赛克**的唯一执行规格是 `MARKUP_PLAN.md`(期号 A1–A4,不要和 PLAN.md 的 M1–M6 混用);实现 agent 先读该文件第 0 节再写代码。**编辑器交互升级(B0 打磨 / B1 画布缩放 / B2 形状工具 / B3 顶栏收敛 / B4 文字角柄+荧光笔)**的唯一执行规格是 `EDIT_UX_PLAN.md`(期号 B0–B4,**已全部落地**:B0 v0.5.26–0.5.36、B1 0.6.0、B2 0.6.1、B3 0.6.2、B4 0.6.3,as-built 偏差见其文档头)。选型与竞品的调研依据存档在 `RESEARCH.md`(仅参考,非规格)。以下是其中最易被违反的硬约束。
 
 ## 构建 / 测试
 - 纯 SPM 构建,**不建 xcodeproj**(`xcode-select` 当前指向 CommandLineTools);需要 IDE 时用 Xcode 直接打开 `Package.swift`。

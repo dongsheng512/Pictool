@@ -1,6 +1,9 @@
 # 编辑器交互升级执行规格(给实现 agent)
 
-> 状态:**B0 已落地**(2026-09-05,v0.5.26,含 P0/P1/P2 全部十项);**B1–B4 规划中,未实现**。本文期号 **B0–B4**,不要和 `MARKUP_PLAN.md` 的 A1–A4、`PLAN.md` 的 M1–M6 混用。
+> 状态:**B0–B4 已全部落地**(B0 v0.5.26–0.5.36;B1 0.6.0 / B2 0.6.1 / B3 0.6.2 / B4 0.6.3,2026-09-05)。本文期号 **B0–B4**,不要和 `MARKUP_PLAN.md` 的 A1–A4、`PLAN.md` 的 M1–M6 混用。
+> B1 as-built:`EditCanvasMath.swift`(Models);手势全部挂在 `CanvasMouseCatcher`(scrollWheel/magnify/空格键本地监听),`MarkupCanvas` 接 zoom/pan 并回传容器尺寸。
+> B2 as-built:`ShapeKind` + `.shape(kind:from:to:widthLevel:colorIndex:)`;几何纯函数在 `MarkupGeometry`;实时预览走 SwiftUI Path,提交后进统一渲染器。
+> B4 as-built:`text.sizeFraction`(连续,三档 chip 为预设,`clampTextFraction` 夹取 0.015–0.120)+ 选中框右下角手柄拖拽;荧光笔 = `.stroke(..., style: StrokeStyleKind)`,渲染 alpha 0.45 + `highlighterWidths` 表,H 键切换。
 > 对标交互参考:**macOS 预览(Preview.app)的标记工具栏**——只借鉴交互模型,不看它的代码。
 > 基线:仓库现有统一编辑器 `Sources/Pictool/Views/EditView.swift`(预览.app 式单行工具条 + 归一化标注)。
 > 版本节奏**由用户决定**:每期合入时同步 `build.sh` 的 `CFBundleShortVersionString` + `README.md`「版本」小节,具体号用户说了算。

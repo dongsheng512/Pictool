@@ -6,21 +6,19 @@ struct ThumbnailGridView: View {
     @Environment(FolderStore.self) private var store
     /// 是否处于向上扩展态(由 SidebarView 持有,联动压缩文件夹树)
     @Binding var expanded: Bool
+    @State private var headerHovering = false
 
     private let columns = [GridItem(.adaptive(minimum: 72, maximum: 120), spacing: 6)]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "photo.grid")
-                    .foregroundStyle(.secondary)
-                Text("缩略图")
+            // 左:标题+计数一组;右:恢复链接与箭头。整行可点切换展开
+            HStack(spacing: 8) {
+                Text("缩略图 · \(store.images.count)")
                     .font(.callout.weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
                 Spacer()
-                // 这里原本有两个 Spacer(),把展开按钮顶到了中间;只保留一个让它靠右
-                Text("\(store.images.count)")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
                 if store.hiddenCountInCurrentFolder > 0 {
                     Button {
                         store.unhideAllInCurrentFolder()
@@ -32,16 +30,22 @@ struct ThumbnailGridView: View {
                     .foregroundStyle(Color.accentColor)
                     .help("恢复本文件夹中被隐藏的图片")
                 }
-                Button {
-                    expanded.toggle()
-                } label: {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.up")
-                }
-                .buttonStyle(FlatPillButtonStyle())
-                .help(expanded ? "复原缩略图区域" : "扩大缩略图区域")
+                Image(systemName: expanded ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(headerHovering ? Color.primary : Color.secondary)
             }
+            .contentShape(Rectangle())
+            .onHover { headerHovering = $0 }
+            .onTapGesture { expanded.toggle() }
+            .help(expanded ? "复原缩略图区域" : "扩大缩略图区域")
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
+            // 整行 hover 反馈:暗示"这一行是开关",而非只有箭头可点;高亮吃满内边距,外留 4pt
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(headerHovering ? 0.05 : 0))
+            )
+            .padding(.horizontal, 4)
 
             if store.images.isEmpty {
                 // 空态:一张虚线描边的“空缩略图”占位;已选文件夹但无图时才补文字说明
